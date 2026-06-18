@@ -55,13 +55,25 @@ disappears and the image is displayed.
 ## Protocol
 
 darktable communicates via a Unix domain socket at `/tmp/dt_hdr_viewer.sock`.
-Each frame is a simple binary message (all integers little-endian):
+Each frame is a binary message (protocol version 2, all multi-byte values
+little-endian, which matches host byte order on every supported platform):
 
-| Offset | Size | Type    | Description        |
-|--------|------|---------|--------------------|
-| 0      | 4    | uint32  | Image width        |
-| 4      | 4    | uint32  | Image height       |
-| 8      | w*h*3*4 | float32[] | RGB pixels, linear BT.2020, row-major top-to-bottom |
+| Offset | Size      | Type      | Description                                            |
+|--------|-----------|-----------|--------------------------------------------------------|
+| 0      | 4         | bytes     | magic `'D','T','H','V'`                                 |
+| 4      | 4         | uint32    | protocol version (= 2)                                 |
+| 8      | 4         | uint32    | image width                                            |
+| 12     | 4         | uint32    | image height                                           |
+| 16     | 4         | uint32    | channels (= 3)                                         |
+| 20     | 4         | uint32    | transfer (0 = linear)                                  |
+| 24     | 36        | float32[9]| working RGB → XYZ(D50) matrix, row-major               |
+| 60     | w*h*3*4   | float32[] | RGB pixels, **working-space linear**, row-major top-to-bottom |
+
+The pixels are the fully-edited image in the darktable working profile's linear
+primaries (linear Rec.2020 by default), tapped at the input to the output color
+profile module (`colorout`) so super-white (> 1.0) HDR signal is intact and the
+display TRC has not yet been baked in. The `RGB → XYZ(D50)` matrix lets the
+viewer color-manage correctly for any working profile.
 
 A new connection is established per frame (or the connection may be kept
 open for multiple frames; the server handles both).
@@ -77,7 +89,7 @@ for reference. The canonical copy lives in the darktable tree at
 
 int fd = dt_hdr_viewer_connect();
 if (fd >= 0) {
-    dt_hdr_viewer_send_frame(fd, width, height, rgb_linear_bt2020);
+    dt_hdr_viewer_send_frame(fd, width, height, rgb_linear, rgb_to_xyz);
     dt_hdr_viewer_disconnect(fd);
 }
 ```
@@ -92,15 +104,17 @@ darktable process                     HDRViewer.app
 ─────────────────                     ─────────────────────────────────────
 hdr_viewer.c             Unix socket  IPCServer.swift
   connect()          ──────────────▶   accept()
-  send_frame()       ──────frame──▶    decode → [Float]
-  disconnect()                              │
+  send_frame()       ──────frame──▶    decode v2 → HDRFrame
+  disconnect()                              │  (pixels + RGB→XYZ matrix)
                                       HDRViewController.swift
                                             │  DispatchQueue.main
                                       HDRMetalView.swift
                                             │  MTLTexture (RGBA32Float)
                                       ShaderSource.swift (embedded MSL)
-                                            │  BT.2020 → Display-P3
-                                            │  tone map to [0, EDR headroom]
+                                            │  work RGB → XYZ(D50) [per frame]
+                                            │  → XYZ(D65) [Bradford]
+                                            │  → linear Display-P3
+                                            │  WYSIWYG clip at EDR headroom
                                       CAMetalLayer (RGBA16Float, EDR)
                                             │
                                       Display hardware (HDR)
@@ -108,15 +122,24 @@ hdr_viewer.c             Unix socket  IPCServer.swift
 
 ### Shader pipeline
 
-1. **Sample** the source RGBA32Float texture (linear BT.2020).
-2. **Matrix multiply** with the BT.2020 → Linear Display-P3 3x3 matrix.
-3. **Tone map** using a smooth knee:
-   - Values <= 1.0 pass through unchanged (SDR range).
-   - Values in (1.0, EDR headroom] are kept as HDR signal.
-   - Values above `headroom` are soft-compressed toward `headroom`.
-4. **Output** as `half4` into the `RGBA16Float` CAMetalLayer drawable, whose
-   colorspace is set to `extendedLinearDisplayP3` so the OS compositor
-   interprets the values correctly without additional color conversion.
+1. **Sample** the source RGBA32Float texture (working-space linear RGB).
+2. **Color-manage** to linear Display-P3:
+   - `working RGB → XYZ(D50)` using the per-frame matrix from the header,
+   - `XYZ(D50) → XYZ(D65)` via a constant Bradford adaptation,
+   - `XYZ(D65) → linear Display-P3` via a constant matrix.
+3. **Gamut**: out-of-P3 colors (negative channels) are softly compressed toward
+   the achromatic axis, then clamped to ≥ 0.
+4. **Display mapping**:
+   - On an **HDR display** (headroom > 1): values pass through unchanged
+     (WYSIWYG); the compositor/display clips at the panel's peak. No tone map,
+     no highlight roll-off, matching pro grading tools.
+   - On an **SDR display** (headroom = 1): a Reinhard curve preserves highlight
+     detail since the surface has no room above 1.0.
+   - Press **`c`** to toggle a clipping warning that flags pixels above the
+     display's EDR headroom (rendered magenta).
+5. **Output** as `half4` into the `RGBA16Float` CAMetalLayer drawable, whose
+   colorspace is `extendedLinearDisplayP3`, so 1.0 maps to SDR reference white
+   and the OS compositor shows higher values brighter without extra conversion.
 
 ### EDR headroom
 

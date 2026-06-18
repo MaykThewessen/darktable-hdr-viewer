@@ -38,7 +38,11 @@ static int write_exact(int fd, const void *buf, size_t len)
     size_t      left = len;
 
     while (left > 0) {
+#ifdef __linux__
+        ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
+#else
         ssize_t n = write(fd, p, left);
+#endif
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -68,6 +72,15 @@ int dt_hdr_viewer_connect(void)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    /* Prevent SIGPIPE from killing the calling process if the viewer
+     * crashes or disconnects while we are writing a frame. */
+#ifdef SO_NOSIGPIPE
+    {
+        int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+    }
+#endif
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -154,14 +167,27 @@ int dt_hdr_viewer_connect(void)
 void dt_hdr_viewer_send_frame(int              fd,
                               uint32_t         w,
                               uint32_t         h,
-                              const float     *rgb_linear_bt2020)
+                              const float     *rgb_linear,
+                              const float      rgb_to_xyz[9])
 {
-    if (fd < 0 || w == 0 || h == 0 || rgb_linear_bt2020 == NULL) return;
+    if (fd < 0 || w == 0 || h == 0 || rgb_linear == NULL || rgb_to_xyz == NULL)
+        return;
 
-    /* Send 8-byte header: width and height as little-endian uint32 */
-    uint8_t header[8];
-    encode_le32(header + 0, w);
-    encode_le32(header + 4, h);
+    /* Header (protocol v2, 60 bytes), see hdr_viewer.h for the layout.
+     * The magic is written as literal bytes so it is endian-independent;
+     * integers are little-endian; floats are copied in host byte order
+     * (little-endian on every supported platform). */
+    uint8_t header[60];
+    header[0] = 'D';
+    header[1] = 'T';
+    header[2] = 'H';
+    header[3] = 'V';
+    encode_le32(header +  4, DT_HDR_VIEWER_VERSION);
+    encode_le32(header +  8, w);
+    encode_le32(header + 12, h);
+    encode_le32(header + 16, 3u);                       /* channels */
+    encode_le32(header + 20, DT_HDR_VIEWER_XFER_LINEAR);
+    memcpy(header + 24, rgb_to_xyz, 9u * sizeof(float)); /* 36 bytes */
 
     if (write_exact(fd, header, sizeof(header)) != 0) return;
 
@@ -170,7 +196,7 @@ void dt_hdr_viewer_send_frame(int              fd,
      * which matches what the Swift receiver expects.
      * If big-endian support is ever needed, swap bytes here. */
     size_t pixel_bytes = (size_t)w * (size_t)h * 3u * sizeof(float);
-    write_exact(fd, rgb_linear_bt2020, pixel_bytes);
+    write_exact(fd, rgb_linear, pixel_bytes);
     /* Errors are silently ignored; caller should reconnect if needed. */
 }
 
