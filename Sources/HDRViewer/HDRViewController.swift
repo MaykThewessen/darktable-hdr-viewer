@@ -55,15 +55,15 @@ final class HDRViewController: NSViewController {
 
     private func startIPCServer() {
         ipcServer = IPCServer(socketPath: IPCServer.defaultSocketPath)
-        ipcServer.onFrame = { [weak self] width, height, pixels in
-            self?.handleFrame(width: width, height: height, pixels: pixels)
+        ipcServer.onFrame = { [weak self] frame in
+            self?.handleFrame(frame)
         }
         ipcServer.start()
     }
 
     // MARK: - Frame handling
 
-    private func handleFrame(width: UInt32, height: UInt32, pixels: [Float]) {
+    private func handleFrame(_ frame: HDRFrame) {
         // Update the Metal view on the main thread
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -73,8 +73,8 @@ final class HDRViewController: NSViewController {
                 self.statusLabel.isHidden = true
             }
 
-            let w = Int(width)
-            let h = Int(height)
+            let w = Int(frame.width)
+            let h = Int(frame.height)
 
             // Update aspect ratio and resize window if this is the first frame
             // or the image dimensions changed.
@@ -84,7 +84,8 @@ final class HDRViewController: NSViewController {
                 self.adjustWindowForAspectRatio()
             }
 
-            self.hdrView.updateTexture(width: w, height: h, pixels: pixels)
+            self.hdrView.updateTexture(width: w, height: h,
+                                       pixels: frame.pixels, rgbToXYZ: frame.rgbToXYZ)
         }
     }
 

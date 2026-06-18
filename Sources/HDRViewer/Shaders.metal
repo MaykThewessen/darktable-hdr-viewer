@@ -2,18 +2,19 @@
 using namespace metal;
 
 // ---------------------------------------------------------------------------
-// Vertex shader
+// NOTE: This file is the readable reference copy of the shaders. The app
+// compiles the identical source embedded in ShaderSource.swift at runtime
+// (it is excluded from the SPM target). Keep the two in sync.
 // ---------------------------------------------------------------------------
-// Generates a single full-screen triangle from 3 vertices with no vertex
-// buffer. The triangle is large enough to cover the entire clip-space quad
-// [-1,+1] x [-1,+1].
 //
-//  Vertex 0: (-1, -1)  →  UV (0, 1)   bottom-left
-//  Vertex 1: ( 3, -1)  →  UV (2, 1)   far right
-//  Vertex 2: (-1,  3)  →  UV (0,-1)   far top
-//
-// The texture coordinate convention in Metal is (0,0) = top-left, which
-// matches the row-major top-to-bottom pixel data sent by darktable.
+// Color pipeline (all linear light):
+//   working RGB --(uni.rgbToXYZ, per frame)--> XYZ(D50)
+//               --(Bradford)--> XYZ(D65)
+//               --(constant)--> linear Display-P3
+// Output goes to an extendedLinearDisplayP3 RGBA16Float drawable, where 1.0 ==
+// SDR reference white and values up to the display's EDR headroom are shown
+// brighter. No tone mapping on HDR displays (WYSIWYG; the display clips at its
+// peak). On SDR displays a Reinhard curve preserves highlight detail.
 
 struct VertexOut {
     float4 position [[position]];
@@ -22,115 +23,88 @@ struct VertexOut {
 
 vertex VertexOut vertexPassthrough(uint vid [[vertex_id]])
 {
-    // Full-screen triangle trick – no vertex buffer needed
     const float2 positions[3] = {
         float2(-1.0f, -1.0f),
         float2( 3.0f, -1.0f),
         float2(-1.0f,  3.0f)
     };
-    // Map clip-space [-1,1] → UV [0,1].  Note: Metal UV origin is top-left,
-    // clip-space Y is bottom=−1, top=+1, so we flip Y.
     const float2 texcoords[3] = {
         float2(0.0f, 1.0f),
         float2(2.0f, 1.0f),
         float2(0.0f, -1.0f)
     };
-
     VertexOut out;
     out.position = float4(positions[vid], 0.0f, 1.0f);
     out.texcoord = texcoords[vid];
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Uniforms
-// ---------------------------------------------------------------------------
+// Layout must match `struct Uniforms` in HDRMetalView.swift.
 struct Uniforms {
-    float edrHeadroom;   // maximumExtendedDynamicRangeColorComponentValue
-    float _pad0;
-    float _pad1;
-    float _pad2;
+    float3x3 rgbToXYZ;     // working RGB -> XYZ(D50), supplied per frame
+    float    edrHeadroom;  // display max EDR component value (>= 1.0)
+    float    showClipping; // 0 or 1: highlight over-range pixels
+    float    _pad0;
+    float    _pad1;
 };
 
-// ---------------------------------------------------------------------------
-// Color matrix: BT.2020 linear D65 → Linear Display-P3 D65
-// ---------------------------------------------------------------------------
-// Derived from: BT.2020 → XYZ(D65) → Display-P3
-// Column vectors are BT.2020 primaries expressed in Display-P3.
-//
-// Each column of a float3x3 in MSL is a column vector.
-constant float3x3 BT2020_TO_DISPLAY_P3 = float3x3(
-    //  col 0 (R)         col 1 (G)          col 2 (B)
-    float3( 1.3441f,  -0.1145f, -0.2298f),   // row 0 → P3 R
-    float3(-0.2817f,   1.2095f,  0.0723f),   // row 1 → P3 G
-    float3( 0.0053f,  -0.0358f,  1.0305f)    // row 2 → P3 B
+// Bradford chromatic adaptation XYZ(D50) -> XYZ(D65). Columns for M * v.
+constant float3x3 BRADFORD_D50_TO_D65 = float3x3(
+    float3( 0.9555766f, -0.0282895f,  0.0122982f),
+    float3(-0.0230393f,  1.0099416f, -0.0204830f),
+    float3( 0.0631636f,  0.0210077f,  1.3299098f)
 );
 
-// ---------------------------------------------------------------------------
-// Tone mapping
-// ---------------------------------------------------------------------------
-// We use a simple "knee" function:
-//   - Values ≤ SDR_WHITE pass through unchanged (pure linear)
-//   - Values above SDR_WHITE are compressed toward edrHeadroom using a
-//     smooth Reinhard-style knee so that specular highlights are visible
-//     as HDR signal rather than clipping.
-//
-// If the display does not support EDR (headroom == 1.0), a standard
-// Reinhard curve is applied to keep everything in [0, 1].
-//
-// This is intentionally minimal. Replace with your preferred operator.
+// XYZ(D65) -> linear Display-P3. Columns for M * v.
+constant float3x3 XYZ_D65_TO_DISPLAY_P3 = float3x3(
+    float3( 2.4934969f, -0.8294890f,  0.0358458f),
+    float3(-0.9313836f,  1.7626641f, -0.0761724f),
+    float3(-0.4027108f,  0.0236247f,  0.9568845f)
+);
 
-constant float SDR_WHITE = 1.0f;   // in linear Display-P3
+constant float3 LUM_P3 = float3(0.2290f, 0.6917f, 0.0793f); // P3 luminance weights
 
-float3 toneMap(float3 c, float headroom)
+// Reinhard global tone map, used only on SDR displays to retain highlight detail.
+float3 reinhardSDR(float3 c)
 {
-    if (headroom <= 1.0f) {
-        // SDR display: simple Reinhard on luminance to avoid hue shifts
-        float lum = dot(c, float3(0.2126f, 0.7152f, 0.0722f));
-        float lumOut = lum / (1.0f + lum);
-        float scale = (lum > 0.0f) ? (lumOut / lum) : 0.0f;
-        return c * scale;
-    }
-
-    // HDR display path: pass through values that are already in [0, headroom].
-    // Apply a soft knee only above headroom to handle extreme values.
-    float3 out;
-    for (int i = 0; i < 3; ++i) {
-        float v = c[i];
-        if (v <= headroom) {
-            out[i] = v;              // preserve HDR signal intact
-        } else {
-            // Soft compress above headroom using Reinhard scaled to headroom
-            out[i] = headroom * (v / (v + headroom - SDR_WHITE));
-        }
-    }
-    return out;
+    float lum = max(dot(c, LUM_P3), 0.0f);
+    float scale = (lum > 0.0f) ? ((lum / (1.0f + lum)) / lum) : 0.0f;
+    return c * scale;
 }
 
-// ---------------------------------------------------------------------------
-// Fragment shader
-// ---------------------------------------------------------------------------
 fragment half4 fragmentHDR(
-    VertexOut        in       [[stage_in]],
-    texture2d<float> srcTex   [[texture(0)]],
-    sampler          smp      [[sampler(0)]],
+    VertexOut          in     [[stage_in]],
+    texture2d<float>   srcTex [[texture(0)]],
+    sampler            smp    [[sampler(0)]],
     constant Uniforms& uni    [[buffer(0)]])
 {
-    // Sample the source texture (linear BT.2020, RGBA32Float)
-    float4 rgba = srcTex.sample(smp, in.texcoord);
-    float3 rgb  = rgba.rgb;
+    float3 rgb = srcTex.sample(smp, in.texcoord).rgb;
 
-    // 1. Convert BT.2020 linear → Linear Display-P3
-    //    The CAMetalLayer colorspace is extendedLinearDisplayP3, so values we
-    //    write here are interpreted as linear Display-P3 by the compositor.
-    float3 p3 = BT2020_TO_DISPLAY_P3 * rgb;
+    // working primaries -> XYZ(D50) -> XYZ(D65) -> linear Display-P3
+    float3 xyz = uni.rgbToXYZ * rgb;
+    xyz        = BRADFORD_D50_TO_D65 * xyz;
+    float3 p3  = XYZ_D65_TO_DISPLAY_P3 * xyz;
 
-    // 2. Clamp negative values (out-of-gamut colors below 0 – rare in practice)
+    // Soft gamut compression for colors outside Display-P3 (negative channels).
+    float minVal = min(min(p3.r, p3.g), p3.b);
+    if(minVal < 0.0f) {
+        float lum = max(dot(p3, LUM_P3), 0.0f);
+        float t = minVal / (minVal - lum + 1e-6f);
+        p3 = mix(p3, float3(lum), saturate(t));
+    }
     p3 = max(p3, float3(0.0f));
 
-    // 3. Tone map to [0, edrHeadroom]
-    float3 mapped = toneMap(p3, uni.edrHeadroom);
+    const float headroom = max(uni.edrHeadroom, 1.0f);
+    bool overRange = (max(max(p3.r, p3.g), p3.b) > headroom);
 
-    // Output as half4; Metal will store this as RGBA16Float in the drawable.
-    return half4(half3(mapped), 1.0h);
+    if(uni.edrHeadroom <= 1.0f) {
+        p3 = reinhardSDR(p3); // SDR display fallback
+    }
+    // HDR display: pass through unchanged (WYSIWYG).
+
+    if(uni.showClipping > 0.5f && overRange) {
+        p3 = float3(1.0f, 0.0f, 1.0f); // magenta clip marker
+    }
+
+    return half4(half3(p3), 1.0h);
 }

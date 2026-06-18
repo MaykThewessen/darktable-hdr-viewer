@@ -1,18 +1,36 @@
 import Foundation
 import Darwin
 
+/// One decoded frame from darktable: working-space linear RGB pixels plus the
+/// working profile's RGB -> XYZ(D50) matrix needed to color-manage them.
+struct HDRFrame {
+    let width: UInt32
+    let height: UInt32
+    /// Interleaved RGB float32, linear working primaries, row-major top-to-bottom.
+    let pixels: [Float]
+    /// Row-major 3x3 working-RGB -> XYZ(D50) matrix (9 floats).
+    let rgbToXYZ: [Float]
+}
+
 /// Listens on a Unix domain socket and decodes pixel frames sent by darktable.
 ///
-/// Packet format (little-endian):
-///   [4 bytes] width  – UInt32
-///   [4 bytes] height – UInt32
-///   [width * height * 3 * 4 bytes] – Float32 RGB, linear BT.2020, row-major top-to-bottom
+/// Wire format (protocol v2, little-endian) — see darktable's hdr_viewer.h:
+///   [4]  magic 'D','T','H','V'
+///   [4]  version (UInt32, = 2)
+///   [4]  width  (UInt32)
+///   [4]  height (UInt32)
+///   [4]  channels (UInt32, = 3)
+///   [4]  transfer (UInt32, 0 = linear)
+///   [36] rgb_to_xyz : 9 x Float32, row-major working RGB -> XYZ(D50)
+///   [w*h*3*4] Float32 RGB pixels, row-major top-to-bottom
 final class IPCServer {
 
     static let defaultSocketPath = "/tmp/dt_hdr_viewer.sock"
+    static let protocolVersion: UInt32 = 2
+    static let headerSize = 60
 
     /// Called on a background thread with each decoded frame.
-    var onFrame: ((_ width: UInt32, _ height: UInt32, _ pixels: [Float]) -> Void)?
+    var onFrame: ((HDRFrame) -> Void)?
 
     private let socketPath: String
     private var serverFD: Int32 = -1
@@ -129,24 +147,49 @@ final class IPCServer {
     private func handleClient(_ fd: Int32) {
         defer { Darwin.close(fd) }
 
-        // Read header: 4+4 bytes
-        var width:  UInt32 = 0
-        var height: UInt32 = 0
-
-        guard readExact(fd: fd, into: &width,  count: 4),
-              readExact(fd: fd, into: &height, count: 4)
-        else {
+        // Read the fixed-size header in one shot.
+        var header = [UInt8](repeating: 0, count: IPCServer.headerSize)
+        guard readExactBytes(fd: fd, buffer: &header, byteCount: IPCServer.headerSize) else {
             printErr("IPCServer: failed to read header")
             return
         }
 
-        // Ensure little-endian (darktable sends LE)
-        width  = UInt32(littleEndian: width)
-        height = UInt32(littleEndian: height)
+        // Validate magic 'DTHV'.
+        guard header[0] == 0x44, header[1] == 0x54, header[2] == 0x48, header[3] == 0x56 else {
+            printErr("IPCServer: bad magic (expected DTHV)")
+            return
+        }
 
+        func le32(_ off: Int) -> UInt32 {
+            UInt32(header[off]) | (UInt32(header[off + 1]) << 8)
+                | (UInt32(header[off + 2]) << 16) | (UInt32(header[off + 3]) << 24)
+        }
+
+        let version  = le32(4)
+        let width    = le32(8)
+        let height   = le32(12)
+        let channels = le32(16)
+        // transfer = le32(20) — reserved (0 = linear); only linear is sent today.
+
+        guard version == IPCServer.protocolVersion else {
+            printErr("IPCServer: unsupported protocol version \(version)")
+            return
+        }
+        guard channels == 3 else {
+            printErr("IPCServer: unsupported channel count \(channels)")
+            return
+        }
         guard width > 0, height > 0, width <= 32768, height <= 32768 else {
             printErr("IPCServer: invalid dimensions \(width)x\(height)")
             return
+        }
+
+        // Extract the 9-float RGB -> XYZ(D50) matrix (bytes 24..59, host-order Float32).
+        var rgbToXYZ = [Float](repeating: 0, count: 9)
+        header.withUnsafeBytes { raw in
+            for i in 0 ..< 9 {
+                rgbToXYZ[i] = raw.loadUnaligned(fromByteOffset: 24 + i * 4, as: Float.self)
+            }
         }
 
         let floatCount = Int(width) * Int(height) * 3
@@ -161,17 +204,10 @@ final class IPCServer {
         // On little-endian hosts (all modern Macs) Float byte order is native,
         // so no byte-swapping is needed.
 
-        onFrame?(width, height, pixels)
+        onFrame?(HDRFrame(width: width, height: height, pixels: pixels, rgbToXYZ: rgbToXYZ))
     }
 
     // MARK: - Low-level I/O helpers
-
-    /// Read exactly `count` bytes into a value via its raw pointer.
-    private func readExact<T>(fd: Int32, into value: inout T, count: Int) -> Bool {
-        return withUnsafeMutableBytes(of: &value) { ptr in
-            readExactBytes(fd: fd, buffer: ptr.baseAddress!, byteCount: count)
-        }
-    }
 
     private func readExactBytes(fd: Int32, buffer: UnsafeMutableRawPointer, byteCount: Int) -> Bool {
         var remaining = byteCount

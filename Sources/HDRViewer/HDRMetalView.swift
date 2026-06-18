@@ -1,6 +1,7 @@
 import AppKit
 import Metal
 import QuartzCore
+import simd
 
 /// An NSView subclass that hosts a CAMetalLayer configured for EDR (Extended Dynamic Range).
 /// Receives linear BT.2020 float data, uploads it to a texture, and renders it via a
@@ -17,14 +18,37 @@ final class HDRMetalView: NSView {
     /// The source texture in RGBA32Float (linear BT.2020, padded to RGBA)
     private var sourceTexture: MTLTexture?
 
-    /// Uniform buffer carrying the EDR headroom value passed to the shader
+    /// Uniform buffer carrying per-frame color-management state to the shader.
     private var uniformBuffer: MTLBuffer!
 
+    /// Working-RGB -> XYZ(D50) matrix received with the current frame.
+    private var rgbToXYZ: simd_float3x3 = matrix_identity_float3x3
+
+    /// When true, pixels exceeding the display's EDR headroom are highlighted.
+    /// Toggled with the "c" key. Defaults to off for an unobstructed preview.
+    var showClipping: Bool = false {
+        didSet { if sourceTexture != nil { render() } }
+    }
+
+    // Layout must match `struct Uniforms` in ShaderSource.swift.
     private struct Uniforms {
-        var edrHeadroom: Float
+        var rgbToXYZ: simd_float3x3   // working RGB -> XYZ(D50)
+        var edrHeadroom: Float        // display max EDR component value
+        var showClipping: Float       // 0 or 1
         var _pad0: Float = 0
         var _pad1: Float = 0
-        var _pad2: Float = 0
+    }
+
+    /// Build a column-major simd matrix from a row-major 9-float RGB->XYZ matrix.
+    /// Row-major means xyz[i] = sum_j m[i*3+j] * rgb[j]; simd computes
+    /// M * v = col0*v.x + col1*v.y + col2*v.z, so column j = (m[0][j], m[1][j], m[2][j]).
+    private static func matrix3x3(fromRowMajor m: [Float]) -> simd_float3x3 {
+        guard m.count == 9 else { return matrix_identity_float3x3 }
+        return simd_float3x3(columns: (
+            SIMD3<Float>(m[0], m[3], m[6]),
+            SIMD3<Float>(m[1], m[4], m[7]),
+            SIMD3<Float>(m[2], m[5], m[8])
+        ))
     }
 
     // MARK: - Metal layer
@@ -137,9 +161,13 @@ final class HDRMetalView: NSView {
     // MARK: - Texture upload
 
     /// Called from the main thread with new pixel data from darktable.
-    /// `pixels` is interleaved RGB float32 in linear BT.2020, row-major, top-to-bottom.
-    func updateTexture(width: Int, height: Int, pixels: [Float]) {
+    /// `pixels` is interleaved RGB float32 in the working profile's linear
+    /// primaries, row-major, top-to-bottom. `rgbToXYZ` is the row-major 3x3
+    /// matrix converting those primaries to XYZ(D50).
+    func updateTexture(width: Int, height: Int, pixels: [Float], rgbToXYZ: [Float]) {
         guard width > 0, height > 0 else { return }
+
+        self.rgbToXYZ = HDRMetalView.matrix3x3(fromRowMajor: rgbToXYZ)
 
         // (Re)create the texture if dimensions changed
         if sourceTexture == nil
@@ -195,7 +223,9 @@ final class HDRMetalView: NSView {
         )
 
         // Write uniforms
-        var uniforms = Uniforms(edrHeadroom: headroom)
+        var uniforms = Uniforms(rgbToXYZ: rgbToXYZ,
+                                edrHeadroom: headroom,
+                                showClipping: showClipping ? 1.0 : 0.0)
         memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
 
         let rpDesc = MTLRenderPassDescriptor()
@@ -242,6 +272,21 @@ final class HDRMetalView: NSView {
         super.viewDidMoveToWindow()
         if let scale = window?.backingScaleFactor {
             metalLayer.contentsScale = scale
+        }
+        // Become first responder so the clipping-warning toggle key works.
+        window?.makeFirstResponder(self)
+    }
+
+    // MARK: - Keyboard
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        // "c" toggles the clipping (over-range) warning overlay.
+        if event.charactersIgnoringModifiers?.lowercased() == "c" {
+            showClipping.toggle()
+        } else {
+            super.keyDown(with: event)
         }
     }
 }
