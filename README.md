@@ -97,6 +97,22 @@ if (fd >= 0) {
 `dt_hdr_viewer_connect()` returns -1 (and does **not** block) when the viewer
 is not running, so it is safe to call unconditionally in a hot path.
 
+## Testing without darktable
+
+`tools/test-sender.c` sends a synthetic protocol-v2 frame so you can verify a
+build end-to-end without darktable. It links the reference client, so it
+exercises the exact wire format. With the viewer running:
+
+```sh
+clang -O2 -I. tools/test-sender.c dt_hdr_client.c -o /tmp/dt-hdr-test-sender
+/tmp/dt-hdr-test-sender
+```
+
+A horizontal ramp (0 → 4.0, the right third super-white) in red/green/blue bands
+appears. The viewer prints `IPCServer: frame WxH ch=3 …` for each frame it
+decodes. On an HDR display the right side is visibly brighter than SDR white;
+press **`c`** to flag pixels above the display's EDR headroom.
+
 ## Architecture
 
 ```
