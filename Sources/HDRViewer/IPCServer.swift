@@ -204,6 +204,9 @@ final class IPCServer {
         // On little-endian hosts (all modern Macs) Float byte order is native,
         // so no byte-swapping is needed.
 
+        print("IPCServer: frame \(width)x\(height) ch=\(channels) "
+              + "rgb->xyz[0]=\(rgbToXYZ[0])")
+
         onFrame?(HDRFrame(width: width, height: height, pixels: pixels, rgbToXYZ: rgbToXYZ))
     }
 
