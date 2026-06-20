@@ -28,11 +28,36 @@ struct HDRFrame {
 ///   [4]  transfer (UInt32, 0 = linear)
 ///   [36] rgb_to_xyz : 9 x Float32, row-major working RGB -> XYZ(D50)
 ///   [w*h*3*4] Float32 RGB pixels, row-major top-to-bottom
+///
+/// Robustness contract:
+///   darktable opens a NEW connection PER FRAME, so the accept loop must stay
+///   resilient: a malformed, truncated, oversized, or aborted client must never
+///   crash the process, leak a file descriptor, or wedge the loop. Every header
+///   field is validated defensively and frames are byte-capped before any
+///   allocation, so hostile or corrupt input cannot exhaust memory.
+///
+///   onFrame is invoked on the IPC background thread. If frames arrive faster
+///   than the UI can render, the consumer (the view controller) is expected to
+///   coalesce on the main thread and keep only the latest frame; this server
+///   intentionally does no buffering of its own.
 final class IPCServer {
 
     static let defaultSocketPath = "/tmp/dt_hdr_viewer.sock"
     static let protocolVersion: UInt32 = 2
     static let headerSize = 60
+
+    /// Hard ceiling on a single frame's pixel payload, independent of the
+    /// dimension checks, so a plausible-looking but absurd width*height can't
+    /// trigger a multi-gigabyte allocation. ~512 MB of float32 pixels.
+    static let maxPixelBytes = 512 * 1024 * 1024
+
+    /// Largest single recv() chunk. Bounds the kernel copy and keeps progress
+    /// observable; the read loop iterates until the full payload is in.
+    private static let maxChunk = 8 * 1024 * 1024
+
+    /// Per-frame receive timeout (seconds). Generous for any one frame; guards
+    /// against a client that connects, sends a partial header, then stalls.
+    private static let recvTimeoutSeconds: Int = 5
 
     /// Called on a background thread with each decoded frame.
     var onFrame: ((HDRFrame) -> Void)?
@@ -41,6 +66,10 @@ final class IPCServer {
     private var serverFD: Int32 = -1
     private var isRunning = false
     private let queue = DispatchQueue(label: "com.darktable.hdr-viewer.ipc", qos: .userInteractive)
+
+    /// Reused pixel buffer to avoid per-frame allocation churn when frames are
+    /// the same size (the common live-preview case). Only touched on `queue`.
+    private var pixelScratch: [Float] = []
 
     init(socketPath: String = IPCServer.defaultSocketPath) {
         self.socketPath = socketPath
@@ -62,6 +91,8 @@ final class IPCServer {
 
     func stop() {
         isRunning = false
+        // Closing the listening fd unblocks a pending accept() with EBADF,
+        // which the loop treats as a shutdown signal.
         if serverFD >= 0 {
             Darwin.close(serverFD)
             serverFD = -1
@@ -72,30 +103,41 @@ final class IPCServer {
     // MARK: - Accept loop
 
     private func runAcceptLoop() {
-        // Remove stale socket file
+        // Ignore SIGPIPE process-wide: writing to a peer that vanished must
+        // surface as EPIPE, never as a fatal signal. (We only read, but the
+        // peer may also reset the connection.)
+        signal(SIGPIPE, SIG_IGN)
+
+        // Remove any stale socket file from a previous run.
         unlink(socketPath)
 
-        // Create UNIX domain socket
+        // Create UNIX domain socket.
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            printErr("IPCServer: socket() failed: \(String(cString: strerror(errno)))")
+            printErr("IPCServer: socket() failed: \(errnoString())")
             return
         }
         serverFD = fd
 
-        // Set SO_REUSEADDR
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
 
-        // Bind
+        // Bind. sun_path is a fixed C array; refuse paths that don't fit rather
+        // than silently binding to a truncated path.
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
+        let pathCapacity = MemoryLayout.size(ofValue: addr.sun_path) - 1
+        let pathBytes = Array(socketPath.utf8)
+        guard pathBytes.count <= pathCapacity else {
+            printErr("IPCServer: socket path too long (\(pathBytes.count) > \(pathCapacity))")
+            Darwin.close(fd)
+            serverFD = -1
+            return
+        }
         withUnsafeMutableBytes(of: &addr.sun_path) { ptr in
-            socketPath.withCString { cstr in
-                _ = strncpy(ptr.baseAddress!.assumingMemoryBound(to: CChar.self),
-                            cstr,
-                            ptr.count - 1)
-            }
+            let base = ptr.baseAddress!.assumingMemoryBound(to: CChar.self)
+            for (i, b) in pathBytes.enumerated() { base[i] = CChar(bitPattern: b) }
+            base[pathBytes.count] = 0
         }
 
         let bindResult = withUnsafePointer(to: &addr) {
@@ -104,15 +146,18 @@ final class IPCServer {
             }
         }
         guard bindResult == 0 else {
-            printErr("IPCServer: bind() failed: \(String(cString: strerror(errno)))")
+            printErr("IPCServer: bind() failed: \(errnoString())")
             Darwin.close(fd)
+            serverFD = -1
             return
         }
 
-        // Listen (backlog = 4; darktable typically sends one frame at a time)
-        guard listen(fd, 4) == 0 else {
-            printErr("IPCServer: listen() failed: \(String(cString: strerror(errno)))")
+        // Listen. darktable reconnects per frame, so a small backlog lets a new
+        // connection queue while we decode the previous one.
+        guard listen(fd, 8) == 0 else {
+            printErr("IPCServer: listen() failed: \(errnoString())")
             Darwin.close(fd)
+            serverFD = -1
             return
         }
 
@@ -129,20 +174,28 @@ final class IPCServer {
             }
 
             guard clientFD >= 0 else {
-                if errno == EINTR || errno == EBADF { break }
-                printErr("IPCServer: accept() failed: \(String(cString: strerror(errno)))")
+                // EINTR: interrupted by a signal, just retry the accept.
+                if errno == EINTR { continue }
+                // EBADF/EINVAL: listening fd was closed by stop(), shut down.
+                if errno == EBADF || errno == EINVAL { break }
+                // ECONNABORTED / EMFILE / ENFILE etc.: transient per-connection
+                // or resource pressure. Log and keep serving.
+                if !isRunning { break }
+                printErr("IPCServer: accept() failed: \(errnoString())")
                 continue
             }
 
-            // Set a receive timeout so we don't block forever if darktable
-            // crashes mid-frame. 5 seconds is generous for any single frame.
-            var tv = timeval(tv_sec: 5, tv_usec: 0)
-            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            // Per-frame receive timeout so a stalled or crashed client can't
+            // pin a worker forever waiting on a half-sent frame.
+            var tv = timeval(tv_sec: IPCServer.recvTimeoutSeconds, tv_usec: 0)
+            setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                       socklen_t(MemoryLayout<timeval>.size))
 
             handleClient(clientFD)
         }
 
         Darwin.close(fd)
+        if serverFD == fd { serverFD = -1 }
         unlink(socketPath)
         print("IPCServer: stopped.")
     }
@@ -150,12 +203,12 @@ final class IPCServer {
     // MARK: - Client handling
 
     private func handleClient(_ fd: Int32) {
-        defer { Darwin.close(fd) }
+        defer { Darwin.close(fd) }  // always reclaim the client fd
 
-        // Read the fixed-size header in one shot.
+        // Read the fixed-size header in full.
         var header = [UInt8](repeating: 0, count: IPCServer.headerSize)
         guard readExactBytes(fd: fd, buffer: &header, byteCount: IPCServer.headerSize) else {
-            printErr("IPCServer: failed to read header")
+            printErr("IPCServer: failed to read header (client disconnected or timed out)")
             return
         }
 
@@ -174,7 +227,7 @@ final class IPCServer {
         let width    = le32(8)
         let height   = le32(12)
         let channels = le32(16)
-        // transfer = le32(20) — reserved (0 = linear); only linear is sent today.
+        let transfer = le32(20)  // reserved; 0 = linear (the only mode sent today)
 
         guard version == IPCServer.protocolVersion else {
             printErr("IPCServer: unsupported protocol version \(version)")
@@ -184,41 +237,93 @@ final class IPCServer {
             printErr("IPCServer: unsupported channel count \(channels)")
             return
         }
-        guard width > 0, height > 0, width <= 32768, height <= 32768 else {
+        guard transfer == 0 else {
+            printErr("IPCServer: unsupported transfer function \(transfer)")
+            return
+        }
+        guard width >= 1, height >= 1, width <= 32768, height <= 32768 else {
             printErr("IPCServer: invalid dimensions \(width)x\(height)")
             return
         }
 
-        // Extract the 9-float RGB -> XYZ(D50) matrix (bytes 24..59, host-order Float32).
+        // Compute the payload size with overflow-safe arithmetic and enforce the
+        // absolute byte ceiling BEFORE allocating anything. width/height are each
+        // <= 32768 so the products stay well within Int on 64-bit, but we guard
+        // explicitly so this stays correct if the bounds ever change.
+        let w = Int(width)
+        let h = Int(height)
+        let (pixCount, mulOverflow) = w.multipliedReportingOverflow(by: h)
+        guard !mulOverflow else {
+            printErr("IPCServer: pixel count overflow for \(width)x\(height)")
+            return
+        }
+        let (floatCount, mul3Overflow) = pixCount.multipliedReportingOverflow(by: 3)
+        guard !mul3Overflow else {
+            printErr("IPCServer: float count overflow for \(width)x\(height)")
+            return
+        }
+        let (byteCount, mul4Overflow) = floatCount.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        guard !mul4Overflow else {
+            printErr("IPCServer: byte count overflow for \(width)x\(height)")
+            return
+        }
+        guard byteCount <= IPCServer.maxPixelBytes else {
+            printErr("IPCServer: frame too large (\(byteCount) bytes > cap \(IPCServer.maxPixelBytes)); rejecting \(width)x\(height)")
+            return
+        }
+
+        // Extract the 9-float RGB -> XYZ(D50) matrix (bytes 24..59, host-order
+        // Float32 little-endian). Reject non-finite matrices: a NaN/Inf here
+        // would propagate into the color transform and produce garbage.
         var rgbToXYZ = [Float](repeating: 0, count: 9)
         header.withUnsafeBytes { raw in
             for i in 0 ..< 9 {
                 rgbToXYZ[i] = raw.loadUnaligned(fromByteOffset: 24 + i * 4, as: Float.self)
             }
         }
+        guard rgbToXYZ.allSatisfy({ $0.isFinite }) else {
+            printErr("IPCServer: non-finite rgb->xyz matrix; rejecting frame")
+            return
+        }
 
-        let floatCount = Int(width) * Int(height) * 3
-        let byteCount  = floatCount * MemoryLayout<Float>.size
+        // Reuse the pixel buffer across frames when sizes match; only grow/shrink
+        // when the frame size changes. Bounded by the byte ceiling above.
+        if pixelScratch.count != floatCount {
+            pixelScratch = [Float](repeating: 0, count: floatCount)
+        }
 
-        var pixels = [Float](repeating: 0, count: floatCount)
-        guard readExactBytes(fd: fd, buffer: &pixels, byteCount: byteCount) else {
-            printErr("IPCServer: failed to read pixel data (\(byteCount) bytes)")
+        let ok = pixelScratch.withUnsafeMutableBytes { ptr -> Bool in
+            guard let base = ptr.baseAddress, ptr.count >= byteCount else { return false }
+            return readExactBytes(fd: fd, buffer: base, byteCount: byteCount)
+        }
+        guard ok else {
+            printErr("IPCServer: failed to read pixel data (\(byteCount) bytes; truncated or timed out)")
             return
         }
 
         // On little-endian hosts (all modern Macs) Float byte order is native,
         // so no byte-swapping is needed.
 
-        // Diagnostic: pixel value range + full matrix, to debug color/brightness.
+        // Diagnostic + scene-referred detection: pixel value range and the full
+        // matrix. NaN/Inf in pixel data is tolerated (the shader clamps), so we
+        // only track finite extrema for a meaningful min/max.
         var pmin: Float = .greatestFiniteMagnitude
         var pmax: Float = -.greatestFiniteMagnitude
         var psum: Double = 0
-        for v in pixels {
-            if v < pmin { pmin = v }
-            if v > pmax { pmax = v }
-            psum += Double(v)
+        var finiteCount = 0
+        pixelScratch.withUnsafeBufferPointer { buf in
+            for i in 0 ..< floatCount {
+                let v = buf[i]
+                if v.isFinite {
+                    if v < pmin { pmin = v }
+                    if v > pmax { pmax = v }
+                    psum += Double(v)
+                    finiteCount += 1
+                }
+            }
         }
-        let pmean = pixels.isEmpty ? 0 : Float(psum / Double(pixels.count))
+        if finiteCount == 0 { pmin = 0; pmax = 0 }
+        let pmean = finiteCount == 0 ? 0 : Float(psum / Double(finiteCount))
         let m = rgbToXYZ
         print(String(format:
             "IPCServer: frame %ux%u ch=%u  px[min=%.4f max=%.4f mean=%.4f]  "
@@ -226,36 +331,60 @@ final class IPCServer {
             width, height, channels, pmin, pmax, pmean,
             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]))
 
-        onFrame?(HDRFrame(width: width, height: height, pixels: pixels,
-                          rgbToXYZ: rgbToXYZ, pmin: pmin, pmax: pmax))
+        // Hand a fresh copy to the consumer so our reusable scratch buffer can be
+        // overwritten by the next frame without racing the UI's coalescing read.
+        let frame = HDRFrame(width: width, height: height,
+                             pixels: Array(pixelScratch[0 ..< floatCount]),
+                             rgbToXYZ: rgbToXYZ, pmin: pmin, pmax: pmax)
+        onFrame?(frame)
     }
 
     // MARK: - Low-level I/O helpers
 
+    /// Read exactly `byteCount` bytes into `buffer`, looping over short reads.
+    /// Returns false on clean EOF (peer closed), recv timeout (EAGAIN/
+    /// EWOULDBLOCK), or any unrecoverable error. EINTR is retried.
     private func readExactBytes(fd: Int32, buffer: UnsafeMutableRawPointer, byteCount: Int) -> Bool {
         var remaining = byteCount
         var offset    = 0
         while remaining > 0 {
-            let n = recv(fd, buffer.advanced(by: offset), remaining, 0)
-            if n <= 0 {
-                if n == 0 { return false }  // connection closed
-                if errno == EINTR { continue }
-                return false
+            let chunk = min(remaining, IPCServer.maxChunk)
+            let n = recv(fd, buffer.advanced(by: offset), chunk, 0)
+            if n > 0 {
+                offset    += n
+                remaining -= n
+                continue
             }
-            offset    += n
-            remaining -= n
+            if n == 0 {
+                return false  // peer closed connection (mid-frame if remaining > 0)
+            }
+            // n < 0: inspect errno.
+            switch errno {
+            case EINTR:
+                continue  // interrupted by signal, retry
+            case EAGAIN, EWOULDBLOCK:
+                return false  // SO_RCVTIMEO fired: client stalled mid-frame
+            default:
+                return false  // ECONNRESET, EPIPE, EBADF, etc.
+            }
         }
         return true
     }
 
-    private func readExactBytes(fd: Int32, buffer: inout [Float], byteCount: Int) -> Bool {
-        buffer.withUnsafeMutableBytes { ptr in
-            readExactBytes(fd: fd, buffer: ptr.baseAddress!, byteCount: byteCount)
+    private func readExactBytes(fd: Int32, buffer: inout [UInt8], byteCount: Int) -> Bool {
+        guard byteCount <= buffer.count else { return false }
+        return buffer.withUnsafeMutableBytes { ptr in
+            guard let base = ptr.baseAddress else { return false }
+            return readExactBytes(fd: fd, buffer: base, byteCount: byteCount)
         }
     }
 }
 
 // MARK: - Helpers
+
+private func errnoString() -> String {
+    String(cString: strerror(errno))
+}
 
 private func printErr(_ msg: String) {
     let data = ((msg + "\n").data(using: .utf8)) ?? Data()

@@ -1,25 +1,37 @@
 import AppKit
 import Metal
 import QuartzCore
+import CoreVideo
 import simd
 
 /// An NSView subclass that hosts a CAMetalLayer configured for EDR (Extended Dynamic Range).
-/// Receives linear BT.2020 float data, uploads it to a texture, and renders it via a
+/// Receives linear working-RGB float data, uploads it to a texture, and renders it via a
 /// Metal render pipeline that converts to Display-P3 linear and outputs RGBA16Float for EDR.
+///
+/// The view continuously auto-adjusts to the CURRENT display EDR headroom: a CVDisplayLink
+/// tied to the window's current display re-checks the headroom every vsync and re-renders
+/// only when something actually changed (new frame, or a headroom/screen change). This keeps
+/// the preview correct as the user changes brightness or drags the window between displays,
+/// without waiting for a new frame from darktable and without burning the GPU at full rate.
 final class HDRMetalView: NSView {
 
     // MARK: - Metal objects
 
-    private var device: MTLDevice!
-    private var commandQueue: MTLCommandQueue!
-    private var renderPipeline: MTLRenderPipelineState!
-    private var samplerState: MTLSamplerState!
+    /// Optional so a missing GPU / failed shader compile degrades gracefully (log + render
+    /// nothing) instead of a hard crash. Every render path guards on these being present.
+    private var device: MTLDevice?
+    private var commandQueue: MTLCommandQueue?
+    private var renderPipeline: MTLRenderPipelineState?
+    private var samplerState: MTLSamplerState?
 
-    /// The source texture in RGBA32Float (linear BT.2020, padded to RGBA)
+    /// True once setupMetal() built a usable pipeline. When false the view renders nothing.
+    private var metalReady = false
+
+    /// The source texture in RGBA32Float (linear working-RGB, padded to RGBA).
     private var sourceTexture: MTLTexture?
 
     /// Uniform buffer carrying per-frame color-management state to the shader.
-    private var uniformBuffer: MTLBuffer!
+    private var uniformBuffer: MTLBuffer?
 
     /// Working-RGB -> XYZ(D50) matrix received with the current frame.
     private var rgbToXYZ: simd_float3x3 = matrix_identity_float3x3
@@ -27,18 +39,34 @@ final class HDRMetalView: NSView {
     /// Last logged EDR headroom, so we only print when it changes.
     private static var lastLoggedHeadroom: Float = -1
 
-    /// EDR headroom applied by the most recent render. The refresh timer uses
-    /// this to detect display brightness/headroom changes and re-render.
+    // MARK: - Auto-adjust state
+
+    /// EDR headroom applied by the most recent render. Compared against the live screen
+    /// value each display-link tick to detect brightness/headroom changes and re-render.
     private var lastRenderedHeadroom: Float = -1
-    /// Periodic timer that re-renders when the display's EDR headroom changes
-    /// (e.g. the user adjusts brightness) even without a new frame from darktable,
-    /// so the HDR preview never goes stale against the current display state.
-    private var headroomTimer: Timer?
+
+    /// The headroom of the window's current screen, cached on the MAIN thread whenever the
+    /// screen or screen parameters change. The display-link callback (background thread)
+    /// reads only this cached value, never touching AppKit/NSScreen off-main.
+    private var cachedScreenHeadroom: Float = 1.0
+
+    /// Set on the main thread whenever new frame data arrives, the clipping toggle flips,
+    /// the layout changes, or the screen/headroom changes. The display-link callback marshals
+    /// to main, and only re-encodes when this is set, so an idle preview costs ~zero GPU.
+    private var needsRender = false
+
+    /// CVDisplayLink driving continuous auto-adjust, retargeted to the window's current
+    /// display on every screen change. Fires on a background thread.
+    private var displayLink: CVDisplayLink?
+
+    /// The CGDirectDisplayID the display link is currently bound to, so we only retarget
+    /// (which briefly stops/starts the link) when the display actually changes.
+    private var currentDisplayID: CGDirectDisplayID = 0
 
     /// When true, pixels exceeding the display's EDR headroom are highlighted.
     /// Toggled with the "c" key. Defaults to off for an unobstructed preview.
     var showClipping: Bool = false {
-        didSet { if sourceTexture != nil { render() } }
+        didSet { setNeedsRenderAndRefresh() }
     }
 
     // Layout must match `struct Uniforms` in ShaderSource.swift.
@@ -66,8 +94,9 @@ final class HDRMetalView: NSView {
 
     override var wantsUpdateLayer: Bool { true }
 
-    private var metalLayer: CAMetalLayer {
-        return layer as! CAMetalLayer
+    /// Safe accessor: returns nil if the backing layer is not (yet) a CAMetalLayer.
+    private var metalLayer: CAMetalLayer? {
+        return layer as? CAMetalLayer
     }
 
     // MARK: - Init
@@ -86,38 +115,36 @@ final class HDRMetalView: NSView {
         wantsLayer = true
 
         guard let device = MTLCreateSystemDefaultDevice() else {
-            fatalError("No Metal-capable GPU found.")
+            // No Metal-capable GPU: degrade to a black view rather than crashing the
+            // user's daily-driver tool. Nothing will render but the app stays alive.
+            NSLog("HDRMetalView: no Metal-capable GPU found; rendering disabled.")
+            return
         }
         self.device = device
 
         setupLayer()
         setupMetal()
-        startHeadroomTracking()
-    }
 
-    /// Re-render when the display's EDR headroom changes (e.g. the user adjusts
-    /// brightness), even if darktable has not sent a new frame. Without this the
-    /// preview keeps the headroom from its last frame and looks wrong (SDR after
-    /// brightness goes up, or not-yet-HDR after brightness comes down). The poll
-    /// is cheap; a re-render only happens when the headroom actually shifts.
-    private func startHeadroomTracking() {
-        headroomTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self = self, self.sourceTexture != nil else { return }
-            let cur = Float(self.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
-            if abs(cur - self.lastRenderedHeadroom) > 0.01 {
-                self.render()
-            }
-        }
+        // Observe display reconfiguration (resolution, HDR enable, brightness-driven
+        // headroom changes that come through as screen-parameter changes, displays
+        // added/removed). Window-move-between-screens is handled separately below.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
 
     // MARK: - Layer setup
 
     override func makeBackingLayer() -> CALayer {
-        return CAMetalLayer()
+        let ml = CAMetalLayer()
+        return ml
     }
 
     private func setupLayer() {
-        let ml = metalLayer
+        guard let ml = metalLayer else { return }
         ml.device = device
         // RGBA16Float is required for EDR values above 1.0
         ml.pixelFormat = .rgba16Float
@@ -139,7 +166,12 @@ final class HDRMetalView: NSView {
     // MARK: - Metal setup
 
     private func setupMetal() {
-        commandQueue = device.makeCommandQueue()!
+        guard let device = device else { return }
+        guard let queue = device.makeCommandQueue() else {
+            NSLog("HDRMetalView: failed to create command queue; rendering disabled.")
+            return
+        }
+        commandQueue = queue
 
         // Compile shaders from the embedded source string at runtime.
         // This avoids SPM resource bundle complexities and works in all contexts.
@@ -147,14 +179,17 @@ final class HDRMetalView: NSView {
         do {
             library = try device.makeLibrary(source: metalShaderSource, options: nil)
         } catch {
-            fatalError("Failed to compile Metal shaders: \(error)")
+            // Degrade gracefully: a shader-compile failure should not take down the app.
+            NSLog("HDRMetalView: failed to compile Metal shaders: \(error); rendering disabled.")
+            return
         }
 
         guard
             let vertexFn   = library.makeFunction(name: "vertexPassthrough"),
             let fragmentFn = library.makeFunction(name: "fragmentHDR")
         else {
-            fatalError("Metal shader functions not found. Ensure Shaders.metal is included in the target.")
+            NSLog("HDRMetalView: Metal shader functions not found; rendering disabled.")
+            return
         }
 
         let pipelineDesc = MTLRenderPipelineDescriptor()
@@ -166,7 +201,8 @@ final class HDRMetalView: NSView {
         do {
             renderPipeline = try device.makeRenderPipelineState(descriptor: pipelineDesc)
         } catch {
-            fatalError("Failed to create render pipeline: \(error)")
+            NSLog("HDRMetalView: failed to create render pipeline: \(error); rendering disabled.")
+            return
         }
 
         // Bilinear sampler – good quality for scaling the image to window size
@@ -176,13 +212,23 @@ final class HDRMetalView: NSView {
         samplerDesc.mipFilter             = .notMipmapped
         samplerDesc.sAddressMode          = .clampToEdge
         samplerDesc.tAddressMode          = .clampToEdge
-        samplerState = device.makeSamplerState(descriptor: samplerDesc)!
+        guard let sampler = device.makeSamplerState(descriptor: samplerDesc) else {
+            NSLog("HDRMetalView: failed to create sampler state; rendering disabled.")
+            return
+        }
+        samplerState = sampler
 
         // Uniform buffer (single struct, reused every frame)
-        uniformBuffer = device.makeBuffer(
+        guard let ubuf = device.makeBuffer(
             length: MemoryLayout<Uniforms>.stride,
             options: .storageModeShared
-        )!
+        ) else {
+            NSLog("HDRMetalView: failed to create uniform buffer; rendering disabled.")
+            return
+        }
+        uniformBuffer = ubuf
+
+        metalReady = true
     }
 
     // MARK: - Texture upload
@@ -193,6 +239,13 @@ final class HDRMetalView: NSView {
     /// matrix converting those primaries to XYZ(D50).
     func updateTexture(width: Int, height: Int, pixels: [Float], rgbToXYZ: [Float]) {
         guard width > 0, height > 0 else { return }
+        guard metalReady, let device = device else { return }
+        // Defensive: the caller guarantees interleaved RGB, but never trust a length
+        // mismatch into an out-of-bounds read on the daily driver.
+        guard pixels.count >= width * height * 3 else {
+            NSLog("HDRMetalView: pixel buffer too small (\(pixels.count) < \(width * height * 3)); frame dropped.")
+            return
+        }
 
         self.rgbToXYZ = HDRMetalView.matrix3x3(fromRowMajor: rgbToXYZ)
 
@@ -209,7 +262,11 @@ final class HDRMetalView: NSView {
             )
             desc.usage = [.shaderRead]
             desc.storageMode = .shared
-            sourceTexture = device.makeTexture(descriptor: desc)!
+            guard let tex = device.makeTexture(descriptor: desc) else {
+                NSLog("HDRMetalView: texture allocation failed for \(width)x\(height); frame dropped.")
+                return
+            }
+            sourceTexture = tex
         }
 
         guard let tex = sourceTexture else { return }
@@ -217,49 +274,185 @@ final class HDRMetalView: NSView {
         // Expand RGB → RGBA (Metal has no native RGB32Float texture format)
         let pixelCount = width * height
         var rgba = [Float](repeating: 1.0, count: pixelCount * 4)
-        for i in 0 ..< pixelCount {
-            rgba[i * 4 + 0] = pixels[i * 3 + 0]
-            rgba[i * 4 + 1] = pixels[i * 3 + 1]
-            rgba[i * 4 + 2] = pixels[i * 3 + 2]
-            rgba[i * 4 + 3] = 1.0
+        pixels.withUnsafeBufferPointer { src in
+            rgba.withUnsafeMutableBufferPointer { dst in
+                for i in 0 ..< pixelCount {
+                    dst[i * 4 + 0] = src[i * 3 + 0]
+                    dst[i * 4 + 1] = src[i * 3 + 1]
+                    dst[i * 4 + 2] = src[i * 3 + 2]
+                    // dst[i * 4 + 3] already 1.0 from the initializer
+                }
+            }
         }
 
         rgba.withUnsafeBytes { ptr in
+            guard let base = ptr.baseAddress else { return }
             tex.replace(
                 region: MTLRegionMake2D(0, 0, width, height),
                 mipmapLevel: 0,
-                withBytes: ptr.baseAddress!,
+                withBytes: base,
                 bytesPerRow: width * 4 * MemoryLayout<Float>.size
             )
         }
 
+        // A new frame must always be drawn. Render immediately (we are on main) and also
+        // ensure the display link is running so subsequent headroom changes get picked up.
+        needsRender = true
+        ensureDisplayLinkRunning()
+        render()
+    }
+
+    // MARK: - Continuous auto-adjust (CVDisplayLink)
+
+    /// Refresh the cached screen headroom/colorspace on the MAIN thread and flag a render.
+    /// Safe to call from any AppKit callback (screen change, layout, toggle).
+    private func setNeedsRenderAndRefresh() {
+        refreshScreenState()
+        needsRender = true
+        ensureDisplayLinkRunning()
+    }
+
+    /// Read the current screen's EDR headroom and update the metal layer's per-display
+    /// properties (colorspace, contentsScale). MUST run on the main thread because it
+    /// touches NSWindow/NSScreen and the CAMetalLayer.
+    private func refreshScreenState() {
+        let screen = window?.screen
+        let headroom = Float(screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
+        cachedScreenHeadroom = max(headroom, 1.0)
+
+        if let ml = metalLayer {
+            // Re-assert the extended linear Display-P3 colorspace for the (possibly new)
+            // display, and match its backing scale, so a window dragged to another screen
+            // keeps mapping values correctly and stays sharp.
+            if ml.colorspace == nil,
+               let cs = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3) {
+                ml.colorspace = cs
+            }
+            let scale = window?.backingScaleFactor
+                ?? screen?.backingScaleFactor
+                ?? NSScreen.main?.backingScaleFactor
+                ?? 2.0
+            if ml.contentsScale != scale {
+                ml.contentsScale = scale
+                // Keep the drawable size consistent with the new scale.
+                ml.drawableSize = CGSize(width: bounds.width * scale,
+                                         height: bounds.height * scale)
+            }
+        }
+
+        // Retarget the display link to the screen the window now lives on so it ticks at
+        // that display's refresh rate.
+        retargetDisplayLinkIfNeeded()
+    }
+
+    /// Create the display link lazily and start it. Idempotent.
+    private func ensureDisplayLinkRunning() {
+        if displayLink == nil {
+            var link: CVDisplayLink?
+            let status = CVDisplayLinkCreateWithActiveCGDisplays(&link)
+            guard status == kCVReturnSuccess, let link = link else {
+                NSLog("HDRMetalView: CVDisplayLink creation failed (status \(status)); falling back to frame-driven rendering only.")
+                return
+            }
+            // The output callback runs on a background thread; it only marshals to main.
+            let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+            CVDisplayLinkSetOutputCallback(link, { (_, _, _, _, _, ctx) -> CVReturn in
+                guard let ctx = ctx else { return kCVReturnSuccess }
+                let view = Unmanaged<HDRMetalView>.fromOpaque(ctx).takeUnretainedValue()
+                view.displayLinkTick()
+                return kCVReturnSuccess
+            }, opaqueSelf)
+            displayLink = link
+            retargetDisplayLinkIfNeeded()
+        }
+        if let link = displayLink, !CVDisplayLinkIsRunning(link) {
+            CVDisplayLinkStart(link)
+        }
+    }
+
+    /// Bind the display link to the CGDirectDisplay the window currently occupies, so it
+    /// fires at that display's vsync. Only acts when the display actually changed.
+    private func retargetDisplayLinkIfNeeded() {
+        guard let link = displayLink else { return }
+        // Resolve the current display id from the window's screen.
+        let displayID: CGDirectDisplayID
+        if let screen = window?.screen,
+           let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+            displayID = CGDirectDisplayID(num.uint32Value)
+        } else {
+            displayID = CGMainDisplayID()
+        }
+        guard displayID != currentDisplayID, displayID != 0 else { return }
+        currentDisplayID = displayID
+        CVDisplayLinkSetCurrentCGDisplay(link, displayID)
+    }
+
+    /// Called from the CVDisplayLink BACKGROUND thread every vsync. Does NO AppKit, NO
+    /// drawable access here: it only marshals to the main thread, which owns all the
+    /// state and the only place we touch NSScreen / CAMetalLayer.
+    private func displayLinkTick() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            // Re-read the live screen headroom on main. (Brightness changes on the
+            // built-in XDR panel surface here continuously, often without a screen-
+            // parameters notification.)
+            let live = Float(self.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
+            let liveClamped = max(live, 1.0)
+            if abs(liveClamped - self.cachedScreenHeadroom) > 0.001 {
+                self.cachedScreenHeadroom = liveClamped
+                self.needsRender = true
+            }
+            // Re-render only when something changed: a new frame, a toggle, a layout
+            // change, or the headroom shifted. Avoids busy full-rate GPU when idle.
+            if self.needsRender && abs(self.cachedScreenHeadroom - self.lastRenderedHeadroom) > 0.001 {
+                self.needsRender = true
+            }
+            if self.needsRender {
+                self.render()
+            }
+        }
+    }
+
+    @objc private func screenParametersChanged(_ note: Notification) {
+        // Always on the main thread for AppKit notifications.
+        setNeedsRenderAndRefresh()
         render()
     }
 
     // MARK: - Rendering
 
+    /// MUST be called on the main thread. Encodes one frame, fully fail-safe: any missing
+    /// Metal object, nil drawable, or encoder failure simply skips the frame.
     private func render() {
-        guard
-            let drawable = metalLayer.nextDrawable(),
-            let texture  = sourceTexture
+        guard metalReady,
+              let commandQueue = commandQueue,
+              let renderPipeline = renderPipeline,
+              let samplerState = samplerState,
+              let uniformBuffer = uniformBuffer,
+              let metalLayer = metalLayer,
+              let texture = sourceTexture
         else { return }
 
-        // Read current EDR headroom from the screen. This is the headroom
-        // AVAILABLE RIGHT NOW (depends on the display being in HDR mode and its
-        // brightness); maximumPotential... is the display's capability ceiling.
-        // When current == 1.0 the display exposes no headroom, so nothing can
-        // render brighter than reference white regardless of the signal.
-        let headroom = Float(
-            window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
-        )
-        let potentialHeadroom = Float(
-            window?.screen?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 1.0
-        )
+        // Read current EDR headroom from the screen. This is the headroom AVAILABLE RIGHT
+        // NOW (depends on the display being in HDR mode and its brightness);
+        // maximumPotential... is the display's capability ceiling. When current == 1.0 the
+        // display exposes no headroom, so nothing renders brighter than reference white.
+        // window?.screen is nil while the window is off all screens -> default to 1.0 (SDR).
+        let screen = window?.screen
+        let headroom = max(Float(screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0), 1.0)
+        let potentialHeadroom = Float(screen?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 1.0)
+        cachedScreenHeadroom = headroom
+
         if abs(headroom - HDRMetalView.lastLoggedHeadroom) > 0.01 {
             HDRMetalView.lastLoggedHeadroom = headroom
             print("HDRMetalView: EDR headroom current=\(headroom) potential=\(potentialHeadroom)")
         }
-        lastRenderedHeadroom = headroom
+
+        guard let drawable = metalLayer.nextDrawable() else {
+            // Drawable pool momentarily exhausted (e.g. mid-resize). Keep the dirty flag
+            // set so the next display-link tick retries; do not clear needsRender.
+            return
+        }
 
         // Write uniforms
         var uniforms = Uniforms(rgbToXYZ: rgbToXYZ,
@@ -268,7 +461,7 @@ final class HDRMetalView: NSView {
         memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
 
         let rpDesc = MTLRenderPassDescriptor()
-        rpDesc.colorAttachments[0].texture    = drawable.texture
+        rpDesc.colorAttachments[0].texture     = drawable.texture
         rpDesc.colorAttachments[0].loadAction  = .clear
         rpDesc.colorAttachments[0].storeAction = .store
         rpDesc.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1)
@@ -276,7 +469,10 @@ final class HDRMetalView: NSView {
         guard
             let cmdBuf  = commandQueue.makeCommandBuffer(),
             let encoder = cmdBuf.makeRenderCommandEncoder(descriptor: rpDesc)
-        else { return }
+        else {
+            // Command buffer / encoder creation failed: skip this frame, keep dirty flag.
+            return
+        }
 
         encoder.setRenderPipelineState(renderPipeline)
         encoder.setFragmentTexture(texture, index: 0)
@@ -289,31 +485,69 @@ final class HDRMetalView: NSView {
         encoder.endEncoding()
         cmdBuf.present(drawable)
         cmdBuf.commit()
+
+        // Frame committed for the current state: clear the dirty flag and record the
+        // headroom we drew with, so the display link stays idle until something changes.
+        lastRenderedHeadroom = headroom
+        needsRender = false
     }
 
     // MARK: - Layout
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        guard let ml = metalLayer else { return }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        metalLayer.drawableSize = CGSize(
+        ml.drawableSize = CGSize(
             width:  newSize.width  * scale,
             height: newSize.height * scale
         )
-        // Defer render until the next run loop pass so the CAMetalLayer drawable
-        // pool has time to resize before we request a new drawable.
+        // Defer render until the next run loop pass so the CAMetalLayer drawable pool has
+        // time to resize before we request a new drawable.
         if sourceTexture != nil {
+            needsRender = true
             DispatchQueue.main.async { [weak self] in self?.render() }
         }
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if let scale = window?.backingScaleFactor {
-            metalLayer.contentsScale = scale
+
+        // Observe the window moving to another screen (different headroom / colorspace /
+        // backing scale). The notification fires on the main thread.
+        NotificationCenter.default.removeObserver(
+            self, name: NSWindow.didChangeScreenNotification, object: nil)
+        if let window = window {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowChangedScreen(_:)),
+                name: NSWindow.didChangeScreenNotification,
+                object: window
+            )
         }
-        // Become first responder so the clipping-warning toggle key works.
-        window?.makeFirstResponder(self)
+
+        if window != nil {
+            setNeedsRenderAndRefresh()
+            ensureDisplayLinkRunning()
+            // Become first responder so the clipping-warning toggle key works.
+            window?.makeFirstResponder(self)
+        } else {
+            // Window closed / removed: stop ticking the GPU until a new frame re-attaches.
+            stopDisplayLink()
+        }
+    }
+
+    /// The window moved to a different screen: re-read headroom/colorspace/scale and
+    /// retarget the display link to the new display.
+    @objc private func windowChangedScreen(_ note: Notification) {
+        setNeedsRenderAndRefresh()
+        render()
+    }
+
+    /// Backing properties (e.g. backing scale on display change) updated.
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        setNeedsRenderAndRefresh()
     }
 
     // MARK: - Keyboard
@@ -327,5 +561,26 @@ final class HDRMetalView: NSView {
         } else {
             super.keyDown(with: event)
         }
+    }
+
+    // MARK: - Display-link lifecycle
+
+    private func stopDisplayLink() {
+        if let link = displayLink, CVDisplayLinkIsRunning(link) {
+            CVDisplayLinkStop(link)
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        if let link = displayLink {
+            if CVDisplayLinkIsRunning(link) {
+                CVDisplayLinkStop(link)
+            }
+            // The callback holds an unretained (passUnretained) pointer; clearing it
+            // before the view is gone prevents any late tick from touching freed memory.
+            CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, _ in kCVReturnSuccess }, nil)
+        }
+        displayLink = nil
     }
 }
