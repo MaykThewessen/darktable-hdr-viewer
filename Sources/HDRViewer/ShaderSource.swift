@@ -62,12 +62,22 @@ constant float3x3 XYZ_D65_TO_DISPLAY_P3 = float3x3(
 
 constant float3 LUM_P3 = float3(0.2290f, 0.6917f, 0.0793f); // P3 luminance weights
 
-// Reinhard global tone map, used only on SDR displays to retain highlight detail.
-float3 reinhardSDR(float3 c)
+// Fraction of the display headroom at which the soft shoulder begins. Below
+// knee = SHOULDER_START * headroom the signal passes through 1:1 (WYSIWYG);
+// above it a C1-continuous roll-off compresses gently to the panel ceiling.
+constant float SHOULDER_START = 0.80f;
+
+// Soft shoulder for luminance above the knee. Maps [knee, +inf) -> [knee, ceil)
+// with value=knee and slope=1 at x==knee (C1-continuous with the linear
+// pass-through), asymptoting to ceil. Returns the mapped luminance.
+float softShoulder(float lum, float knee, float ceil)
 {
-    float lum = max(dot(c, LUM_P3), 0.0f);
-    float scale = (lum > 0.0f) ? ((lum / (1.0f + lum)) / lum) : 0.0f;
-    return c * scale;
+    if(lum <= knee) {
+        return lum;                       // pass-through: WYSIWYG below the knee
+    }
+    float span = max(ceil - knee, 1e-6f); // remaining headroom above the knee
+    float x    = lum - knee;              // excess over the knee
+    return knee + span * x / (x + span);  // rational roll-off, slope 1 at x=0
 }
 
 fragment half4 fragmentHDR(
@@ -96,24 +106,35 @@ fragment half4 fragmentHDR(
 
     const float headroom = max(uni.edrHeadroom, 1.0f);
 
-    // Detect values above the display headroom (pre-tone-map) for the warning.
-    bool overRange = (max(max(p3.r, p3.g), p3.b) > headroom);
+    // Over-range detection (any channel or luminance beyond headroom) for the
+    // optional clipping warning.
+    const float lum  = max(dot(p3, LUM_P3), 1e-6f);
+    const float maxC = max(max(p3.r, p3.g), p3.b);
+    bool overRange   = (maxC > headroom) || (lum > headroom);
 
-    // Tone-map into the display range, preserving chromaticity. The incoming
-    // signal is working-linear with super-white intact, so it can sit far above
-    // 1.0 (scene-referred). A per-channel clip desaturates unevenly and tints
-    // highlights magenta/green; instead we scale by a luminance curve and keep
-    // the color ratios. Ratio-preserving Reinhard mapped to the EDR headroom:
-    // [0,inf) -> [0,headroom). On SDR (headroom==1) this is plain Reinhard to
-    // [0,1]; on HDR it uses the panel's extra headroom and never clips a channel.
-    {
-        const float lum = max(dot(p3, LUM_P3), 1e-6f);
-        const float lum_t = headroom * lum / (lum + headroom);
+    // Dynamic-range mapping. Always operate on LUMINANCE and apply a single
+    // scalar (lum_out / lum) to all channels, so chromaticity is preserved and
+    // no channel clips independently (which would tint highlights magenta/green).
+    if(headroom > 1.0f) {
+        // HDR display: WYSIWYG. Display-referred values pass through unchanged
+        // up to the knee (1.0 -> reference white; (1.0, knee] shown brighter),
+        // then a soft shoulder rolls [knee, +inf) into the panel ceiling so the
+        // brightest super-whites never hard-clip. THIS is what makes >1.0
+        // highlights actually appear brighter than paper white.
+        const float knee  = SHOULDER_START * headroom;
+        const float lum_t = softShoulder(lum, knee, headroom);
+        p3 *= lum_t / lum;
+    } else {
+        // SDR display (no headroom): ratio-preserving Reinhard to [0,1] to keep
+        // highlight detail. [0,+inf) -> [0,1), chromaticity preserved.
+        const float lum_t = lum / (1.0f + lum);
         p3 *= lum_t / lum;
     }
 
+    p3 = max(p3, float3(0.0f));
+
     if(uni.showClipping > 0.5f && overRange) {
-        // Flag clipped pixels with magenta at SDR white so they stand out.
+        // Flag over-range pixels with magenta at SDR white so they stand out.
         p3 = float3(1.0f, 0.0f, 1.0f);
     }
 

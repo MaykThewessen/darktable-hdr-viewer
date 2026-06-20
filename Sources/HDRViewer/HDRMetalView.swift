@@ -24,6 +24,17 @@ final class HDRMetalView: NSView {
     /// Working-RGB -> XYZ(D50) matrix received with the current frame.
     private var rgbToXYZ: simd_float3x3 = matrix_identity_float3x3
 
+    /// Last logged EDR headroom, so we only print when it changes.
+    private static var lastLoggedHeadroom: Float = -1
+
+    /// EDR headroom applied by the most recent render. The refresh timer uses
+    /// this to detect display brightness/headroom changes and re-render.
+    private var lastRenderedHeadroom: Float = -1
+    /// Periodic timer that re-renders when the display's EDR headroom changes
+    /// (e.g. the user adjusts brightness) even without a new frame from darktable,
+    /// so the HDR preview never goes stale against the current display state.
+    private var headroomTimer: Timer?
+
     /// When true, pixels exceeding the display's EDR headroom are highlighted.
     /// Toggled with the "c" key. Defaults to off for an unobstructed preview.
     var showClipping: Bool = false {
@@ -81,6 +92,22 @@ final class HDRMetalView: NSView {
 
         setupLayer()
         setupMetal()
+        startHeadroomTracking()
+    }
+
+    /// Re-render when the display's EDR headroom changes (e.g. the user adjusts
+    /// brightness), even if darktable has not sent a new frame. Without this the
+    /// preview keeps the headroom from its last frame and looks wrong (SDR after
+    /// brightness goes up, or not-yet-HDR after brightness comes down). The poll
+    /// is cheap; a re-render only happens when the headroom actually shifts.
+    private func startHeadroomTracking() {
+        headroomTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self, self.sourceTexture != nil else { return }
+            let cur = Float(self.window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
+            if abs(cur - self.lastRenderedHeadroom) > 0.01 {
+                self.render()
+            }
+        }
     }
 
     // MARK: - Layer setup
@@ -217,10 +244,22 @@ final class HDRMetalView: NSView {
             let texture  = sourceTexture
         else { return }
 
-        // Read current EDR headroom from the screen
+        // Read current EDR headroom from the screen. This is the headroom
+        // AVAILABLE RIGHT NOW (depends on the display being in HDR mode and its
+        // brightness); maximumPotential... is the display's capability ceiling.
+        // When current == 1.0 the display exposes no headroom, so nothing can
+        // render brighter than reference white regardless of the signal.
         let headroom = Float(
             window?.screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
         )
+        let potentialHeadroom = Float(
+            window?.screen?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 1.0
+        )
+        if abs(headroom - HDRMetalView.lastLoggedHeadroom) > 0.01 {
+            HDRMetalView.lastLoggedHeadroom = headroom
+            print("HDRMetalView: EDR headroom current=\(headroom) potential=\(potentialHeadroom)")
+        }
+        lastRenderedHeadroom = headroom
 
         // Write uniforms
         var uniforms = Uniforms(rgbToXYZ: rgbToXYZ,
