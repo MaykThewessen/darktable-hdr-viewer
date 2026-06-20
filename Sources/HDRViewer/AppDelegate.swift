@@ -11,8 +11,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // Keep the app (and the IPC server) alive when the preview window is closed.
+    // The window is created with isReleasedWhenClosed = false, so closing it just
+    // orders it out; the next frame from darktable re-shows it (see
+    // HDRViewController.handleFrame). Quit explicitly via the menu (Cmd-Q).
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return true
+        return false
     }
 
     // MARK: - Private

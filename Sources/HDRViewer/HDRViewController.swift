@@ -14,6 +14,12 @@ final class HDRViewController: NSViewController {
     // Status label shown while waiting for the first frame
     private var statusLabel: NSTextField!
 
+    // Banner shown when the incoming frame is scene-referred (no display
+    // transform applied in darktable). Such data is unbounded linear and is not
+    // meant for direct display, so the preview will look wrong until the user
+    // adds filmic rgb or sigmoid.
+    private var warningLabel: NSTextField!
+
     override func loadView() {
         // Create a plain backing view; the HDRMetalView will fill it.
         view = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
@@ -26,6 +32,7 @@ final class HDRViewController: NSViewController {
 
         setupHDRView()
         setupStatusLabel()
+        setupWarningLabel()
         startIPCServer()
     }
 
@@ -53,6 +60,29 @@ final class HDRViewController: NSViewController {
         ])
     }
 
+    private func setupWarningLabel() {
+        warningLabel = NSTextField(labelWithString:
+            "⚠︎ Scene-linear input — no display transform.\n"
+            + "Enable filmic rgb or sigmoid in darktable for a correct preview.")
+        warningLabel.alignment = .center
+        warningLabel.textColor = .black
+        warningLabel.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.92)
+        warningLabel.drawsBackground = true
+        warningLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        warningLabel.maximumNumberOfLines = 0
+        warningLabel.wantsLayer = true
+        warningLabel.layer?.cornerRadius = 6
+        warningLabel.translatesAutoresizingMaskIntoConstraints = false
+        warningLabel.isHidden = true
+
+        view.addSubview(warningLabel)
+        NSLayoutConstraint.activate([
+            warningLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            warningLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
+            warningLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -24)
+        ])
+    }
+
     private func startIPCServer() {
         ipcServer = IPCServer(socketPath: IPCServer.defaultSocketPath)
         ipcServer.onFrame = { [weak self] frame in
@@ -72,6 +102,19 @@ final class HDRViewController: NSViewController {
             if !self.statusLabel.isHidden {
                 self.statusLabel.isHidden = true
             }
+
+            // If the window was closed (the app stays alive), bring it back so a
+            // new frame is never lost behind a missing window.
+            if let win = self.view.window, !win.isVisible {
+                win.makeKeyAndOrderFront(nil)
+            }
+
+            // Flag scene-referred input: filmic/sigmoid output is non-negative and
+            // bounded near [0,1], so large negatives or very high values mean no
+            // display transform is applied. Thresholds are generous so a real HDR
+            // edit (highlights a few × reference white) never trips the warning.
+            let sceneLinear = frame.pmin < -1.0 || frame.pmax > 20.0
+            self.warningLabel.isHidden = !sceneLinear
 
             let w = Int(frame.width)
             let h = Int(frame.height)

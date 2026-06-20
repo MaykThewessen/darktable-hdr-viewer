@@ -10,6 +10,11 @@ struct HDRFrame {
     let pixels: [Float]
     /// Row-major 3x3 working-RGB -> XYZ(D50) matrix (9 floats).
     let rgbToXYZ: [Float]
+    /// Min/max pixel value across all channels. Used to detect scene-referred
+    /// input (no display transform applied): such data carries large negatives
+    /// and values far above 1.0, which can never come out of filmic/sigmoid.
+    let pmin: Float
+    let pmax: Float
 }
 
 /// Listens on a Unix domain socket and decodes pixel frames sent by darktable.
@@ -204,10 +209,25 @@ final class IPCServer {
         // On little-endian hosts (all modern Macs) Float byte order is native,
         // so no byte-swapping is needed.
 
-        print("IPCServer: frame \(width)x\(height) ch=\(channels) "
-              + "rgb->xyz[0]=\(rgbToXYZ[0])")
+        // Diagnostic: pixel value range + full matrix, to debug color/brightness.
+        var pmin: Float = .greatestFiniteMagnitude
+        var pmax: Float = -.greatestFiniteMagnitude
+        var psum: Double = 0
+        for v in pixels {
+            if v < pmin { pmin = v }
+            if v > pmax { pmax = v }
+            psum += Double(v)
+        }
+        let pmean = pixels.isEmpty ? 0 : Float(psum / Double(pixels.count))
+        let m = rgbToXYZ
+        print(String(format:
+            "IPCServer: frame %ux%u ch=%u  px[min=%.4f max=%.4f mean=%.4f]  "
+            + "rgb->xyz(D50)=[%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f]",
+            width, height, channels, pmin, pmax, pmean,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]))
 
-        onFrame?(HDRFrame(width: width, height: height, pixels: pixels, rgbToXYZ: rgbToXYZ))
+        onFrame?(HDRFrame(width: width, height: height, pixels: pixels,
+                          rgbToXYZ: rgbToXYZ, pmin: pmin, pmax: pmax))
     }
 
     // MARK: - Low-level I/O helpers
