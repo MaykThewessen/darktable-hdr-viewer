@@ -97,10 +97,15 @@ fragment half4 fragmentHDR(
     const float headroom = max(uni.edrHeadroom, 1.0f);
     bool overRange = (max(max(p3.r, p3.g), p3.b) > headroom);
 
-    if(uni.edrHeadroom <= 1.0f) {
-        p3 = reinhardSDR(p3); // SDR display fallback
+    // Ratio-preserving Reinhard mapped to the EDR headroom: [0,inf)->[0,headroom).
+    // Scales by a luminance curve and keeps color ratios, so scene-referred
+    // super-white never clips per-channel (which tinted highlights magenta/green).
+    // On SDR (headroom==1) this is plain Reinhard to [0,1].
+    {
+        const float lum = max(dot(p3, LUM_P3), 1e-6f);
+        const float lum_t = headroom * lum / (lum + headroom);
+        p3 *= lum_t / lum;
     }
-    // HDR display: pass through unchanged (WYSIWYG).
 
     if(uni.showClipping > 0.5f && overRange) {
         p3 = float3(1.0f, 0.0f, 1.0f); // magenta clip marker

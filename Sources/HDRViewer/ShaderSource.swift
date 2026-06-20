@@ -96,16 +96,21 @@ fragment half4 fragmentHDR(
 
     const float headroom = max(uni.edrHeadroom, 1.0f);
 
-    // Detect values the display cannot show (above its EDR headroom) before any
-    // clamping, for the optional clipping warning.
+    // Detect values above the display headroom (pre-tone-map) for the warning.
     bool overRange = (max(max(p3.r, p3.g), p3.b) > headroom);
 
-    if(uni.edrHeadroom <= 1.0f) {
-        // SDR display: no headroom for >1.0, so tone map to keep highlights.
-        p3 = reinhardSDR(p3);
+    // Tone-map into the display range, preserving chromaticity. The incoming
+    // signal is working-linear with super-white intact, so it can sit far above
+    // 1.0 (scene-referred). A per-channel clip desaturates unevenly and tints
+    // highlights magenta/green; instead we scale by a luminance curve and keep
+    // the color ratios. Ratio-preserving Reinhard mapped to the EDR headroom:
+    // [0,inf) -> [0,headroom). On SDR (headroom==1) this is plain Reinhard to
+    // [0,1]; on HDR it uses the panel's extra headroom and never clips a channel.
+    {
+        const float lum = max(dot(p3, LUM_P3), 1e-6f);
+        const float lum_t = headroom * lum / (lum + headroom);
+        p3 *= lum_t / lum;
     }
-    // HDR display: pass through unchanged (WYSIWYG). The compositor clips at
-    // the panel's peak luminance; we do not roll off.
 
     if(uni.showClipping > 0.5f && overRange) {
         // Flag clipped pixels with magenta at SDR white so they stand out.
