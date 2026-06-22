@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppIcon.svg — HDR Viewer app icon
+  1024x1024 on a macOS Big Sur squircle canvas
+  Design: camera aperture iris (6 blades) inside a radial HDR bloom gradient,
+  conveying extended dynamic range / photography / light.
+  Inline SVG attributes only — no CSS, works with rsvg-convert / magick / qlmanage.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     viewBox="0 0 1024 1024"
+     width="1024" height="1024">
+  <defs>
+    <!-- Squircle clip (macOS Big Sur icon shape, r ~22.5%) -->
+    <clipPath id="squircle">
+      <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230"/>
+    </clipPath>
+
+    <!-- Background: deep-to-midnight blue radial gradient -->
+    <radialGradient id="bg" cx="50%" cy="42%" r="62%" fx="50%" fy="38%">
+      <stop offset="0%"   stop-color="#1a2540"/>
+      <stop offset="55%"  stop-color="#0d1525"/>
+      <stop offset="100%" stop-color="#050c18"/>
+    </radialGradient>
+
+    <!-- HDR bloom: brilliant white-gold centre, fading out -->
+    <radialGradient id="bloom" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.95"/>
+      <stop offset="12%"  stop-color="#fff8e0" stop-opacity="0.80"/>
+      <stop offset="30%"  stop-color="#ffd966" stop-opacity="0.45"/>
+      <stop offset="55%"  stop-color="#ff9a1a" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#ff6600" stop-opacity="0.00"/>
+    </radialGradient>
+
+    <!-- Aperture fill: dark glass with subtle hue shift -->
+    <radialGradient id="apertureFill" cx="50%" cy="40%" r="60%">
+      <stop offset="0%"   stop-color="#0d1e38"/>
+      <stop offset="100%" stop-color="#050c18"/>
+    </radialGradient>
+
+    <!-- Blade gradient: metallic sheen, bright edge facing centre -->
+    <linearGradient id="blade0" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#c8d8f0" stop-opacity="0.92"/>
+      <stop offset="40%"  stop-color="#6e8cb8" stop-opacity="0.80"/>
+      <stop offset="100%" stop-color="#1e3050" stop-opacity="0.70"/>
+    </linearGradient>
+    <linearGradient id="blade1" x1="100%" y1="0%" x2="0%" y2="100%"
+                    xlink:href="#blade0"/>
+    <linearGradient id="blade2" x1="0%" y1="100%" x2="100%" y2="0%"
+                    xlink:href="#blade0"/>
+    <linearGradient id="blade3" x1="100%" y1="100%" x2="0%" y2="0%"
+                    xlink:href="#blade0"/>
+    <linearGradient id="blade4" x1="50%" y1="0%" x2="50%" y2="100%"
+                    xlink:href="#blade0"/>
+    <linearGradient id="blade5" x1="50%" y1="100%" x2="50%" y2="0%"
+                    xlink:href="#blade0"/>
+
+    <!-- Halo ring behind the aperture -->
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="60%"  stop-color="#ffc94a" stop-opacity="0.00"/>
+      <stop offset="82%"  stop-color="#ffc94a" stop-opacity="0.28"/>
+      <stop offset="90%"  stop-color="#ff8800" stop-opacity="0.40"/>
+      <stop offset="96%"  stop-color="#ff6600" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#ff4400" stop-opacity="0.00"/>
+    </radialGradient>
+
+    <!-- Outer glow for the whole icon -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%"
+            color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="28" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="softBloom" x="-30%" y="-30%" width="160%" height="160%"
+            color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="18" result="b"/>
+      <feComposite in="SourceGraphic" in2="b" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- All content clipped to squircle -->
+  <g clip-path="url(#squircle)">
+
+    <!-- Layer 1: background -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+
+    <!-- Layer 2: HDR bloom disc (large, soft) -->
+    <ellipse cx="512" cy="512" rx="400" ry="400" fill="url(#bloom)"
+             filter="url(#softBloom)"/>
+
+    <!-- Layer 3: warm halo ring -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#halo)"/>
+
+    <!-- Layer 4: six aperture iris blades centred at 512,512
+         Each blade is a rounded parallelogram (a rotated rounded rect)
+         rotated in 60° increments. The blade shape is a narrow ellipse
+         offset from centre, forming a classic iris when overlapped.
+         Blade size: 290x110, centre offset 170 from origin.
+         We define one blade template and rotate 6 copies.
+
+         Blade 0 (0°):   top blade  -->
+    <g transform="translate(512,512)">
+      <!-- Six blades, 60° apart. Each is an ellipse 290x100 px,
+           centred at (0, -170) before rotation, giving a 6-blade iris
+           with inner opening of about r=115. -->
+
+      <!-- Blade 0 -->
+      <ellipse cx="0" cy="-170" rx="140" ry="52"
+               fill="url(#blade0)" opacity="0.88"
+               transform="rotate(0)"/>
+      <!-- Blade 1 -->
+      <ellipse cx="0" cy="-170" rx="140" ry="52"
+               fill="url(#blade1)" opacity="0.88"
+               transform="rotate(60)"/>
+      <!-- Blade 2 -->
+      <ellipse cx="0" cy="-170" rx="140" ry="52"
+               fill="url(#blade2)" opacity="0.88"
+               transform="rotate(120)"/>
+      <!-- Blade 3 -->
+      <ellipse cx="0" cy="-170" rx="140" ry="52"
+               fill="url(#blade3)" opacity="0.88"
+               transform="rotate(180)"/>
+      <!-- Blade 4 -->
+      <ellipse cx="0" cy="-170" rx="140" ry="52"
+               fill="url(#blade4)" opacity="0.88"
+               transform="rotate(240)"/>
+      <!-- Blade 5 -->
+      <ellipse cx="0" cy="-170" rx="140" ry="52"
+               fill="url(#blade5)" opacity="0.88"
+               transform="rotate(300)"/>
+
+      <!-- Darker aperture disc covering the blade centres, leaving the iris ring -->
+      <circle cx="0" cy="0" r="110" fill="url(#apertureFill)" opacity="0.96"/>
+
+      <!-- Inner HDR bloom disc inside the aperture opening -->
+      <circle cx="0" cy="0" r="106" fill="url(#bloom)" opacity="0.72"
+              filter="url(#softBloom)"/>
+
+      <!-- Small specular highlight, upper-left, conveying a lens -->
+      <ellipse cx="-32" cy="-32" rx="18" ry="12"
+               fill="#ffffff" opacity="0.55"
+               transform="rotate(-30, -32, -32)"/>
+    </g>
+
+    <!-- Layer 5: thin luminance scale bar at the bottom — hint at a tonal range meter.
+         Gradient from near-black left to brilliant white right. -->
+    <defs>
+      <linearGradient id="tonebar" x1="0%" y1="0%" x2="100%" y2="0%">
+        <stop offset="0%"   stop-color="#050c18"/>
+        <stop offset="30%"  stop-color="#1e3464"/>
+        <stop offset="60%"  stop-color="#f0a830"/>
+        <stop offset="85%"  stop-color="#ffe070"/>
+        <stop offset="100%" stop-color="#ffffff"/>
+      </linearGradient>
+    </defs>
+    <rect x="160" y="860" width="704" height="26" rx="13" ry="13"
+          fill="url(#tonebar)" opacity="0.72"/>
+
+    <!-- Subtle top-edge specular highlight on the squircle face -->
+    <ellipse cx="512" cy="80" rx="260" ry="50"
+             fill="#ffffff" opacity="0.07"/>
+
+  </g>
+</svg>
