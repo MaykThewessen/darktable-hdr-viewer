@@ -67,6 +67,11 @@ final class IPCServer {
     private var isRunning = false
     private let queue = DispatchQueue(label: "com.darktable.hdr-viewer.ipc", qos: .userInteractive)
 
+    /// Guards `serverFD` and `isRunning`, which are touched from both the caller
+    /// thread (start/stop, e.g. main) and the accept `queue`. Critical sections
+    /// are tiny and never wrap a blocking call, so this cannot deadlock.
+    private let stateLock = NSLock()
+
     /// Reused pixel buffer to avoid per-frame allocation churn when frames are
     /// the same size (the common live-preview case). Only touched on `queue`.
     private var pixelScratch: [Float] = []
@@ -82,21 +87,32 @@ final class IPCServer {
     // MARK: - Start / Stop
 
     func start() {
-        guard !isRunning else { return }
+        stateLock.lock()
+        if isRunning { stateLock.unlock(); return }
         isRunning = true
+        stateLock.unlock()
         queue.async { [weak self] in
             self?.runAcceptLoop()
         }
     }
 
+    /// Thread-safe snapshot of the running flag.
+    private func running() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return isRunning
+    }
+
     func stop() {
+        stateLock.lock()
         isRunning = false
-        // Closing the listening fd unblocks a pending accept() with EBADF,
-        // which the loop treats as a shutdown signal.
-        if serverFD >= 0 {
-            Darwin.close(serverFD)
-            serverFD = -1
-        }
+        let fd = serverFD     // take sole ownership of the listening fd
+        serverFD = -1
+        stateLock.unlock()
+        // Closing the listening fd unblocks a pending accept() with EBADF, which
+        // the loop treats as a shutdown signal. Closed exactly once, here only,
+        // so the accept loop must NOT also close it (avoids a double-close /
+        // fd-reuse race).
+        if fd >= 0 { Darwin.close(fd) }
         unlink(socketPath)
     }
 
@@ -117,7 +133,7 @@ final class IPCServer {
             printErr("IPCServer: socket() failed: \(errnoString())")
             return
         }
-        serverFD = fd
+        stateLock.lock(); serverFD = fd; stateLock.unlock()
 
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -131,7 +147,7 @@ final class IPCServer {
         guard pathBytes.count <= pathCapacity else {
             printErr("IPCServer: socket path too long (\(pathBytes.count) > \(pathCapacity))")
             Darwin.close(fd)
-            serverFD = -1
+            stateLock.lock(); serverFD = -1; stateLock.unlock()
             return
         }
         withUnsafeMutableBytes(of: &addr.sun_path) { ptr in
@@ -148,7 +164,7 @@ final class IPCServer {
         guard bindResult == 0 else {
             printErr("IPCServer: bind() failed: \(errnoString())")
             Darwin.close(fd)
-            serverFD = -1
+            stateLock.lock(); serverFD = -1; stateLock.unlock()
             return
         }
 
@@ -157,13 +173,13 @@ final class IPCServer {
         guard listen(fd, 8) == 0 else {
             printErr("IPCServer: listen() failed: \(errnoString())")
             Darwin.close(fd)
-            serverFD = -1
+            stateLock.lock(); serverFD = -1; stateLock.unlock()
             return
         }
 
         print("IPCServer: listening on \(socketPath)")
 
-        while isRunning {
+        while running() {
             var clientAddr = sockaddr_un()
             var clientAddrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
 
@@ -178,9 +194,12 @@ final class IPCServer {
                 if errno == EINTR { continue }
                 // EBADF/EINVAL: listening fd was closed by stop(), shut down.
                 if errno == EBADF || errno == EINVAL { break }
-                // ECONNABORTED / EMFILE / ENFILE etc.: transient per-connection
-                // or resource pressure. Log and keep serving.
-                if !isRunning { break }
+                if !running() { break }
+                // EMFILE/ENFILE: the process or system is out of file
+                // descriptors. The pending connection stays queued, so retrying
+                // accept() immediately hot-spins this thread at 100% CPU. Back
+                // off briefly to yield, then retry once fds free up.
+                if errno == EMFILE || errno == ENFILE { usleep(100_000) }
                 printErr("IPCServer: accept() failed: \(errnoString())")
                 continue
             }
@@ -194,8 +213,8 @@ final class IPCServer {
             handleClient(clientFD)
         }
 
-        Darwin.close(fd)
-        if serverFD == fd { serverFD = -1 }
+        // The listening fd is owned and closed solely by stop(); do not close it
+        // here (that caused a double-close / fd-reuse race). stop() also unlinks.
         unlink(socketPath)
         print("IPCServer: stopped.")
     }
