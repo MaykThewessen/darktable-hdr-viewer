@@ -353,7 +353,7 @@ final class IPCServer {
         // Hand a fresh copy to the consumer so our reusable scratch buffer can be
         // overwritten by the next frame without racing the UI's coalescing read.
         let frame = HDRFrame(width: width, height: height,
-                             pixels: Array(pixelScratch[0 ..< floatCount]),
+                             pixels: Array(pixelScratch),
                              rgbToXYZ: rgbToXYZ, pmin: pmin, pmax: pmax)
         onFrame?(frame)
     }

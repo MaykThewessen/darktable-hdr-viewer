@@ -30,6 +30,13 @@ final class HDRMetalView: NSView {
     /// The source texture in RGBA32Float (linear working-RGB, padded to RGBA).
     private var sourceTexture: MTLTexture?
 
+    /// Reusable RGB->RGBA expansion buffer, sized to the current frame. Hoisted out
+    /// of updateTexture to avoid a full per-frame allocation (~96 MB at 24 MP) plus
+    /// a redundant memset of the RGB lanes. Alpha is written to 1.0 once on
+    /// (re)allocation and never touched again. Main-thread only (updateTexture runs
+    /// on main), so no synchronization is needed.
+    private var rgbaScratch: [Float] = []
+
     /// Uniform buffer carrying per-frame color-management state to the shader.
     private var uniformBuffer: MTLBuffer?
 
@@ -354,21 +361,26 @@ final class HDRMetalView: NSView {
 
         guard let tex = sourceTexture else { return }
 
-        // Expand RGB → RGBA (Metal has no native RGB32Float texture format)
+        // Expand RGB → RGBA (Metal has no native RGB32Float texture format).
+        // Reuse the scratch buffer across frames; only (re)allocate when the pixel
+        // count changes. The fill sets alpha to 1.0 once on (re)alloc, and the copy
+        // loop only ever writes the RGB lanes, so alpha stays 1.0.
         let pixelCount = width * height
-        var rgba = [Float](repeating: 1.0, count: pixelCount * 4)
+        if rgbaScratch.count != pixelCount * 4 {
+            rgbaScratch = [Float](repeating: 1.0, count: pixelCount * 4)
+        }
         pixels.withUnsafeBufferPointer { src in
-            rgba.withUnsafeMutableBufferPointer { dst in
+            rgbaScratch.withUnsafeMutableBufferPointer { dst in
                 for i in 0 ..< pixelCount {
                     dst[i * 4 + 0] = src[i * 3 + 0]
                     dst[i * 4 + 1] = src[i * 3 + 1]
                     dst[i * 4 + 2] = src[i * 3 + 2]
-                    // dst[i * 4 + 3] already 1.0 from the initializer
+                    // dst[i * 4 + 3] left at 1.0 from the (re)allocation
                 }
             }
         }
 
-        rgba.withUnsafeBytes { ptr in
+        rgbaScratch.withUnsafeBytes { ptr in
             guard let base = ptr.baseAddress else { return }
             tex.replace(
                 region: MTLRegionMake2D(0, 0, width, height),
@@ -493,9 +505,6 @@ final class HDRMetalView: NSView {
             }
             // Re-render only when something changed: a new frame, a toggle, a layout
             // change, or the headroom shifted. Avoids busy full-rate GPU when idle.
-            if self.needsRender && abs(self.cachedScreenHeadroom - self.lastRenderedHeadroom) > 0.001 {
-                self.needsRender = true
-            }
             if self.needsRender {
                 self.render()
             }
@@ -588,6 +597,10 @@ final class HDRMetalView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         guard let ml = metalLayer else { return }
+        // Skip degenerate sizes (window collapsed / transient AppKit layout pass):
+        // a zero-area drawableSize on a CAMetalLayer is invalid. The next valid
+        // resize re-establishes the drawable and schedules a render.
+        guard newSize.width > 0, newSize.height > 0 else { return }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         ml.drawableSize = CGSize(
             width:  newSize.width  * scale,
