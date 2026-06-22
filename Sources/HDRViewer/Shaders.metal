@@ -8,7 +8,8 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 //
 // Color pipeline (all linear light):
-//   working RGB --(uni.rgbToXYZ, per frame)--> XYZ(D50)
+//   working RGB --(* uni.exposureScale, per-frame auto-exposure)--> working RGB
+//               --(uni.rgbToXYZ, per frame)--> XYZ(D50)
 //               --(Bradford)--> XYZ(D65)
 //               --(constant)--> linear Display-P3
 // Output goes to an extendedLinearDisplayP3 RGBA16Float drawable, where 1.0 ==
@@ -41,11 +42,11 @@ vertex VertexOut vertexPassthrough(uint vid [[vertex_id]])
 
 // Layout must match `struct Uniforms` in HDRMetalView.swift.
 struct Uniforms {
-    float3x3 rgbToXYZ;     // working RGB -> XYZ(D50), supplied per frame
-    float    edrHeadroom;  // display max EDR component value (>= 1.0)
-    float    showClipping; // 0 or 1: highlight over-range pixels
+    float3x3 rgbToXYZ;      // working RGB -> XYZ(D50), supplied per frame
+    float    edrHeadroom;   // display max EDR component value (>= 1.0)
+    float    showClipping;  // 0 or 1: highlight over-range pixels
+    float    exposureScale; // per-frame auto-exposure gain on working RGB (1.0 = off)
     float    _pad0;
-    float    _pad1;
 };
 
 // Bradford chromatic adaptation XYZ(D50) -> XYZ(D65). Columns for M * v.
@@ -89,6 +90,14 @@ fragment half4 fragmentHDR(
     constant Uniforms& uni    [[buffer(0)]])
 {
     float3 rgb = srcTex.sample(smp, in.texcoord).rgb;
+
+    // Auto-exposure / reference-white normalization. Scale the working RGB by a
+    // per-frame gain (computed Swift-side as target middle-gray / log-avg
+    // luminance) BEFORE any matrix, so the scene-referred input seats at a
+    // sensible level regardless of its arbitrary absolute scale. This is a
+    // uniform scalar on all channels, so chromaticity is preserved exactly;
+    // luminance is the only thing that moves. exposureScale == 1.0 disables it.
+    rgb *= uni.exposureScale;
 
     // working primaries -> XYZ(D50) -> XYZ(D65) -> linear Display-P3
     float3 xyz = uni.rgbToXYZ * rgb;

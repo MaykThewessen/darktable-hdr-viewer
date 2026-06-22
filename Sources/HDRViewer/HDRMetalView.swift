@@ -69,13 +69,39 @@ final class HDRMetalView: NSView {
         didSet { setNeedsRenderAndRefresh() }
     }
 
+    /// When true, a per-frame auto-exposure gain (computed in updateTexture) seats
+    /// the scene-referred input at a sensible level by mapping the frame's log-average
+    /// (geometric-mean) luminance to a target middle-gray. Toggled with the "e" key.
+    /// Defaults to ON; toggling off applies a unit gain so the user can A/B it.
+    var autoExposure: Bool = true {
+        didSet { setNeedsRenderAndRefresh() }
+    }
+
+    /// Target middle-gray the log-average luminance is mapped to (scene-linear 18%).
+    private static let middleGray: Float = 0.18
+
+    /// Floor for the per-pixel luminance inside the log() to avoid log(0) = -inf,
+    /// and a guard band for the resulting scale so a degenerate frame can't blow up.
+    private static let lumEpsilon: Float = 1e-6
+
+    /// Per-frame auto-exposure gain computed from the latest frame's log-average
+    /// working luminance. 1.0 until the first frame arrives, and whenever auto-
+    /// exposure is toggled off the shader receives 1.0 regardless of this value.
+    private var exposureScale: Float = 1.0
+
+    /// True when the current frame is scene-referred (no display transform applied
+    /// in darktable). Auto-exposure is applied ONLY to such frames; display-referred
+    /// (filmic/sigmoid) frames are already correctly exposed and must pass through
+    /// unchanged so the preview stays WYSIWYG.
+    private var sceneReferred = false
+
     // Layout must match `struct Uniforms` in ShaderSource.swift.
     private struct Uniforms {
         var rgbToXYZ: simd_float3x3   // working RGB -> XYZ(D50)
         var edrHeadroom: Float        // display max EDR component value
         var showClipping: Float       // 0 or 1
+        var exposureScale: Float = 1  // per-frame auto-exposure gain (1.0 = off)
         var _pad0: Float = 0
-        var _pad1: Float = 0
     }
 
     /// Build a column-major simd matrix from a row-major 9-float RGB->XYZ matrix.
@@ -88,6 +114,54 @@ final class HDRMetalView: NSView {
             SIMD3<Float>(m[1], m[4], m[7]),
             SIMD3<Float>(m[2], m[5], m[8])
         ))
+    }
+
+    /// Robust per-frame auto-exposure anchor: the log-average (geometric-mean)
+    /// working luminance, exp(mean(log(max(lum, eps)))). Returns the gain that maps
+    /// that anchor to `middleGray`, i.e. `middleGray / logAvgLum`, so multiplying
+    /// the working RGB by it seats the scene-referred image at a sensible level
+    /// regardless of its arbitrary absolute scale. The geometric mean is dominated
+    /// by the bulk of the image and is insensitive to a few extreme highlights,
+    /// which makes it a stable anchor for scene-linear data with sparse specular
+    /// peaks.
+    ///
+    /// Working luminance per pixel is Y = m[3]*r + m[4]*g + m[5]*b, the Y (middle)
+    /// row of the row-major working-RGB -> XYZ(D50) matrix, so it is exact for the
+    /// frame's actual primaries (no fixed weight assumption). Non-finite pixels and
+    /// non-positive luminance are skipped. Guards against an empty/degenerate frame
+    /// by returning a unit gain (no-op) rather than NaN/Inf.
+    private static func computeExposureScale(width: Int,
+                                             height: Int,
+                                             pixels: [Float],
+                                             rgbToXYZ: [Float]) -> Float {
+        guard rgbToXYZ.count == 9 else { return 1.0 }
+        let yr = rgbToXYZ[3], yg = rgbToXYZ[4], yb = rgbToXYZ[5]
+        let pixelCount = width * height
+        guard pixelCount > 0, pixels.count >= pixelCount * 3 else { return 1.0 }
+
+        var logSum = 0.0
+        var count = 0
+        pixels.withUnsafeBufferPointer { src in
+            for i in 0 ..< pixelCount {
+                let r = src[i * 3 + 0]
+                let g = src[i * 3 + 1]
+                let b = src[i * 3 + 2]
+                let lum = yr * r + yg * g + yb * b
+                // Skip non-finite or non-positive luminance: log() needs lum > 0,
+                // and clamping to eps for huge swaths of black would bias the mean.
+                guard lum.isFinite, lum > lumEpsilon else { continue }
+                logSum += Double(log(lum))
+                count += 1
+            }
+        }
+        guard count > 0 else { return 1.0 }
+
+        let logAvgLum = Float(exp(logSum / Double(count)))
+        guard logAvgLum.isFinite, logAvgLum > lumEpsilon else { return 1.0 }
+
+        let scale = middleGray / logAvgLum
+        guard scale.isFinite, scale > 0 else { return 1.0 }
+        return scale
     }
 
     // MARK: - Metal layer
@@ -237,7 +311,8 @@ final class HDRMetalView: NSView {
     /// `pixels` is interleaved RGB float32 in the working profile's linear
     /// primaries, row-major, top-to-bottom. `rgbToXYZ` is the row-major 3x3
     /// matrix converting those primaries to XYZ(D50).
-    func updateTexture(width: Int, height: Int, pixels: [Float], rgbToXYZ: [Float]) {
+    func updateTexture(width: Int, height: Int, pixels: [Float], rgbToXYZ: [Float],
+                       sceneReferred: Bool) {
         guard width > 0, height > 0 else { return }
         guard metalReady, let device = device else { return }
         // Defensive: the caller guarantees interleaved RGB, but never trust a length
@@ -248,6 +323,14 @@ final class HDRMetalView: NSView {
         }
 
         self.rgbToXYZ = HDRMetalView.matrix3x3(fromRowMajor: rgbToXYZ)
+        self.sceneReferred = sceneReferred
+        // Auto-exposure normalizes scene-referred input only. Display-referred
+        // frames (filmic/sigmoid output) are already correctly exposed, so a unit
+        // gain keeps the preview WYSIWYG instead of re-brightening a graded image.
+        self.exposureScale = sceneReferred
+            ? HDRMetalView.computeExposureScale(width: width, height: height,
+                                                pixels: pixels, rgbToXYZ: rgbToXYZ)
+            : 1.0
 
         // (Re)create the texture if dimensions changed
         if sourceTexture == nil
@@ -354,8 +437,14 @@ final class HDRMetalView: NSView {
                 NSLog("HDRMetalView: CVDisplayLink creation failed (status \(status)); falling back to frame-driven rendering only.")
                 return
             }
-            // The output callback runs on a background thread; it only marshals to main.
-            let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+            // The output callback runs on a background thread and only marshals to
+            // main. Pass a RETAINED reference as its context: CVDisplayLinkStop does
+            // not reliably join an already-executing callback, so an unretained
+            // pointer could be dereferenced just as the view is freed. Holding this
+            // +1 for the process lifetime is intentional — this is the app's single
+            // persistent preview surface (created once, never torn down while the
+            // window exists; stopped, not destroyed, when the window is hidden).
+            let opaqueSelf = Unmanaged.passRetained(self).toOpaque()
             CVDisplayLinkSetOutputCallback(link, { (_, _, _, _, _, ctx) -> CVReturn in
                 guard let ctx = ctx else { return kCVReturnSuccess }
                 let view = Unmanaged<HDRMetalView>.fromOpaque(ctx).takeUnretainedValue()
@@ -454,10 +543,12 @@ final class HDRMetalView: NSView {
             return
         }
 
-        // Write uniforms
+        // Write uniforms. When auto-exposure is toggled off we pass a unit gain so
+        // the shader is a no-op (lets the user A/B the normalization).
         var uniforms = Uniforms(rgbToXYZ: rgbToXYZ,
                                 edrHeadroom: headroom,
-                                showClipping: showClipping ? 1.0 : 0.0)
+                                showClipping: showClipping ? 1.0 : 0.0,
+                                exposureScale: autoExposure ? exposureScale : 1.0)
         memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
 
         let rpDesc = MTLRenderPassDescriptor()
@@ -555,10 +646,14 @@ final class HDRMetalView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     override func keyDown(with event: NSEvent) {
-        // "c" toggles the clipping (over-range) warning overlay.
-        if event.charactersIgnoringModifiers?.lowercased() == "c" {
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "c":
+            // Toggle the clipping (over-range) warning overlay.
             showClipping.toggle()
-        } else {
+        case "e":
+            // Toggle per-frame auto-exposure / reference-white normalization (A/B).
+            autoExposure.toggle()
+        default:
             super.keyDown(with: event)
         }
     }
@@ -577,8 +672,10 @@ final class HDRMetalView: NSView {
             if CVDisplayLinkIsRunning(link) {
                 CVDisplayLinkStop(link)
             }
-            // The callback holds an unretained (passUnretained) pointer; clearing it
-            // before the view is gone prevents any late tick from touching freed memory.
+            // Clear the callback so no late tick can fire. Note: the passRetained
+            // context from ensureDisplayLinkRunning keeps this view alive for the
+            // process lifetime by design, so deinit is not normally reached; we do
+            // NOT release that +1 here (an unbalanced release would over-release).
             CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, _ in kCVReturnSuccess }, nil)
         }
         displayLink = nil

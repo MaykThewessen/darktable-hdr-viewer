@@ -281,7 +281,8 @@ final class HDRViewController: NSViewController {
         }
 
         hdrView.updateTexture(width: w, height: h,
-                              pixels: frame.pixels, rgbToXYZ: frame.rgbToXYZ)
+                              pixels: frame.pixels, rgbToXYZ: frame.rgbToXYZ,
+                              sceneReferred: lastSceneLinear)
 
         refreshOverlay()
     }
