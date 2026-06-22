@@ -1,25 +1,10 @@
 import Foundation
 import Darwin
 
-/// One decoded frame from darktable: working-space linear RGB pixels plus the
-/// working profile's RGB -> XYZ(D50) matrix needed to color-manage them.
-struct HDRFrame {
-    let width: UInt32
-    let height: UInt32
-    /// Interleaved RGB float32, linear working primaries, row-major top-to-bottom.
-    let pixels: [Float]
-    /// Row-major 3x3 working-RGB -> XYZ(D50) matrix (9 floats).
-    let rgbToXYZ: [Float]
-    /// Min/max pixel value across all channels. Used to detect scene-referred
-    /// input (no display transform applied): such data carries large negatives
-    /// and values far above 1.0, which can never come out of filmic/sigmoid.
-    let pmin: Float
-    let pmax: Float
-}
-
 /// Listens on a Unix domain socket and decodes pixel frames sent by darktable.
 ///
-/// Wire format (protocol v2, little-endian) — see darktable's hdr_viewer.h:
+/// Wire format (protocol v2, little-endian) -- see darktable's hdr_viewer.h
+/// and HDRProtocol.swift for the canonical layout. Summary:
 ///   [4]  magic 'D','T','H','V'
 ///   [4]  version (UInt32, = 2)
 ///   [4]  width  (UInt32)
@@ -40,16 +25,16 @@ struct HDRFrame {
 ///   than the UI can render, the consumer (the view controller) is expected to
 ///   coalesce on the main thread and keep only the latest frame; this server
 ///   intentionally does no buffering of its own.
-final class IPCServer {
+public final class IPCServer {
 
-    static let defaultSocketPath = "/tmp/dt_hdr_viewer.sock"
-    static let protocolVersion: UInt32 = 2
-    static let headerSize = 60
+    public static let defaultSocketPath = "/tmp/dt_hdr_viewer.sock"
+    public static let protocolVersion: UInt32 = HDRProtocolVersion
+    public static let headerSize = HDRProtocolHeaderSize
 
     /// Hard ceiling on a single frame's pixel payload, independent of the
     /// dimension checks, so a plausible-looking but absurd width*height can't
     /// trigger a multi-gigabyte allocation. ~512 MB of float32 pixels.
-    static let maxPixelBytes = 512 * 1024 * 1024
+    public static let maxPixelBytes = 512 * 1024 * 1024
 
     /// Largest single recv() chunk. Bounds the kernel copy and keeps progress
     /// observable; the read loop iterates until the full payload is in.
@@ -60,7 +45,7 @@ final class IPCServer {
     private static let recvTimeoutSeconds: Int = 5
 
     /// Called on a background thread with each decoded frame.
-    var onFrame: ((HDRFrame) -> Void)?
+    public var onFrame: ((HDRFrame) -> Void)?
 
     private let socketPath: String
     private var serverFD: Int32 = -1
@@ -76,7 +61,7 @@ final class IPCServer {
     /// the same size (the common live-preview case). Only touched on `queue`.
     private var pixelScratch: [Float] = []
 
-    init(socketPath: String = IPCServer.defaultSocketPath) {
+    public init(socketPath: String = IPCServer.defaultSocketPath) {
         self.socketPath = socketPath
     }
 
@@ -86,7 +71,7 @@ final class IPCServer {
 
     // MARK: - Start / Stop
 
-    func start() {
+    public func start() {
         stateLock.lock()
         if isRunning { stateLock.unlock(); return }
         isRunning = true
@@ -102,7 +87,7 @@ final class IPCServer {
         return isRunning
     }
 
-    func stop() {
+    public func stop() {
         stateLock.lock()
         isRunning = false
         let fd = serverFD     // take sole ownership of the listening fd
@@ -130,7 +115,7 @@ final class IPCServer {
         // Create UNIX domain socket.
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            printErr("IPCServer: socket() failed: \(errnoString())")
+            printIPCErr("IPCServer: socket() failed: \(errnoString())")
             return
         }
         stateLock.lock(); serverFD = fd; stateLock.unlock()
@@ -145,7 +130,7 @@ final class IPCServer {
         let pathCapacity = MemoryLayout.size(ofValue: addr.sun_path) - 1
         let pathBytes = Array(socketPath.utf8)
         guard pathBytes.count <= pathCapacity else {
-            printErr("IPCServer: socket path too long (\(pathBytes.count) > \(pathCapacity))")
+            printIPCErr("IPCServer: socket path too long (\(pathBytes.count) > \(pathCapacity))")
             Darwin.close(fd)
             stateLock.lock(); serverFD = -1; stateLock.unlock()
             return
@@ -162,7 +147,7 @@ final class IPCServer {
             }
         }
         guard bindResult == 0 else {
-            printErr("IPCServer: bind() failed: \(errnoString())")
+            printIPCErr("IPCServer: bind() failed: \(errnoString())")
             Darwin.close(fd)
             stateLock.lock(); serverFD = -1; stateLock.unlock()
             return
@@ -171,7 +156,7 @@ final class IPCServer {
         // Listen. darktable reconnects per frame, so a small backlog lets a new
         // connection queue while we decode the previous one.
         guard listen(fd, 8) == 0 else {
-            printErr("IPCServer: listen() failed: \(errnoString())")
+            printIPCErr("IPCServer: listen() failed: \(errnoString())")
             Darwin.close(fd)
             stateLock.lock(); serverFD = -1; stateLock.unlock()
             return
@@ -200,7 +185,7 @@ final class IPCServer {
                 // accept() immediately hot-spins this thread at 100% CPU. Back
                 // off briefly to yield, then retry once fds free up.
                 if errno == EMFILE || errno == ENFILE { usleep(100_000) }
-                printErr("IPCServer: accept() failed: \(errnoString())")
+                printIPCErr("IPCServer: accept() failed: \(errnoString())")
                 continue
             }
 
@@ -225,88 +210,74 @@ final class IPCServer {
         defer { Darwin.close(fd) }  // always reclaim the client fd
 
         // Read the fixed-size header in full.
-        var header = [UInt8](repeating: 0, count: IPCServer.headerSize)
-        guard readExactBytes(fd: fd, buffer: &header, byteCount: IPCServer.headerSize) else {
-            printErr("IPCServer: failed to read header (client disconnected or timed out)")
+        var headerBytes = [UInt8](repeating: 0, count: IPCServer.headerSize)
+        guard readExactBytes(fd: fd, buffer: &headerBytes, byteCount: IPCServer.headerSize) else {
+            printIPCErr("IPCServer: failed to read header (client disconnected or timed out)")
             return
         }
 
-        // Validate magic 'DTHV'.
-        guard header[0] == 0x44, header[1] == 0x54, header[2] == 0x48, header[3] == 0x56 else {
-            printErr("IPCServer: bad magic (expected DTHV)")
+        // Decode using the canonical parser so this path always exercises the
+        // same logic that tests cover.
+        guard let header = HDRProtocolHeader(parsing: Data(headerBytes)) else {
+            // HDRProtocolHeader.init?(parsing:) logs nothing; emit diagnostics here.
+            // Distinguish the two failure modes to aid debugging.
+            let magic = (headerBytes[0], headerBytes[1], headerBytes[2], headerBytes[3])
+            if magic != (0x44, 0x54, 0x48, 0x56) {
+                printIPCErr("IPCServer: bad magic (expected DTHV)")
+            } else {
+                let ver = UInt32(headerBytes[4]) | (UInt32(headerBytes[5]) << 8)
+                    | (UInt32(headerBytes[6]) << 16) | (UInt32(headerBytes[7]) << 24)
+                printIPCErr("IPCServer: header rejected (version=\(ver) or non-finite matrix)")
+            }
             return
         }
 
-        func le32(_ off: Int) -> UInt32 {
-            UInt32(header[off]) | (UInt32(header[off + 1]) << 8)
-                | (UInt32(header[off + 2]) << 16) | (UInt32(header[off + 3]) << 24)
-        }
+        let version  = header.version
+        let width    = header.width
+        let height   = header.height
+        let channels = header.channels
+        let transfer = header.transfer
+        let rgbToXYZ = header.rgbToXYZ
 
-        let version  = le32(4)
-        let width    = le32(8)
-        let height   = le32(12)
-        let channels = le32(16)
-        let transfer = le32(20)  // reserved; 0 = linear (the only mode sent today)
-
-        guard version == IPCServer.protocolVersion else {
-            printErr("IPCServer: unsupported protocol version \(version)")
-            return
-        }
         guard channels == 3 else {
-            printErr("IPCServer: unsupported channel count \(channels)")
+            printIPCErr("IPCServer: unsupported channel count \(channels)")
             return
         }
         guard transfer == 0 else {
-            printErr("IPCServer: unsupported transfer function \(transfer)")
+            printIPCErr("IPCServer: unsupported transfer function \(transfer)")
             return
         }
         guard width >= 1, height >= 1, width <= 32768, height <= 32768 else {
-            printErr("IPCServer: invalid dimensions \(width)x\(height)")
+            printIPCErr("IPCServer: invalid dimensions \(width)x\(height)")
             return
         }
+        _ = version  // validated by HDRProtocolHeader.init?(parsing:)
 
         // Compute the payload size with overflow-safe arithmetic and enforce the
-        // absolute byte ceiling BEFORE allocating anything. width/height are each
-        // <= 32768 so the products stay well within Int on 64-bit, but we guard
-        // explicitly so this stays correct if the bounds ever change.
+        // absolute byte ceiling BEFORE allocating anything.
         let w = Int(width)
         let h = Int(height)
         let (pixCount, mulOverflow) = w.multipliedReportingOverflow(by: h)
         guard !mulOverflow else {
-            printErr("IPCServer: pixel count overflow for \(width)x\(height)")
+            printIPCErr("IPCServer: pixel count overflow for \(width)x\(height)")
             return
         }
         let (floatCount, mul3Overflow) = pixCount.multipliedReportingOverflow(by: 3)
         guard !mul3Overflow else {
-            printErr("IPCServer: float count overflow for \(width)x\(height)")
+            printIPCErr("IPCServer: float count overflow for \(width)x\(height)")
             return
         }
         let (byteCount, mul4Overflow) = floatCount.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
         guard !mul4Overflow else {
-            printErr("IPCServer: byte count overflow for \(width)x\(height)")
+            printIPCErr("IPCServer: byte count overflow for \(width)x\(height)")
             return
         }
         guard byteCount <= IPCServer.maxPixelBytes else {
-            printErr("IPCServer: frame too large (\(byteCount) bytes > cap \(IPCServer.maxPixelBytes)); rejecting \(width)x\(height)")
+            printIPCErr("IPCServer: frame too large (\(byteCount) bytes > cap \(IPCServer.maxPixelBytes)); rejecting \(width)x\(height)")
             return
         }
 
-        // Extract the 9-float RGB -> XYZ(D50) matrix (bytes 24..59, host-order
-        // Float32 little-endian). Reject non-finite matrices: a NaN/Inf here
-        // would propagate into the color transform and produce garbage.
-        var rgbToXYZ = [Float](repeating: 0, count: 9)
-        header.withUnsafeBytes { raw in
-            for i in 0 ..< 9 {
-                rgbToXYZ[i] = raw.loadUnaligned(fromByteOffset: 24 + i * 4, as: Float.self)
-            }
-        }
-        guard rgbToXYZ.allSatisfy({ $0.isFinite }) else {
-            printErr("IPCServer: non-finite rgb->xyz matrix; rejecting frame")
-            return
-        }
-
-        // Reuse the pixel buffer across frames when sizes match; only grow/shrink
-        // when the frame size changes. Bounded by the byte ceiling above.
+        // Reuse the pixel buffer across frames when sizes match.
         if pixelScratch.count != floatCount {
             pixelScratch = [Float](repeating: 0, count: floatCount)
         }
@@ -316,16 +287,14 @@ final class IPCServer {
             return readExactBytes(fd: fd, buffer: base, byteCount: byteCount)
         }
         guard ok else {
-            printErr("IPCServer: failed to read pixel data (\(byteCount) bytes; truncated or timed out)")
+            printIPCErr("IPCServer: failed to read pixel data (\(byteCount) bytes; truncated or timed out)")
             return
         }
 
         // On little-endian hosts (all modern Macs) Float byte order is native,
         // so no byte-swapping is needed.
 
-        // Diagnostic + scene-referred detection: pixel value range and the full
-        // matrix. NaN/Inf in pixel data is tolerated (the shader clamps), so we
-        // only track finite extrema for a meaningful min/max.
+        // Diagnostic + scene-referred detection.
         var pmin: Float = .greatestFiniteMagnitude
         var pmax: Float = -.greatestFiniteMagnitude
         var psum: Double = 0
@@ -350,8 +319,7 @@ final class IPCServer {
             width, height, channels, pmin, pmax, pmean,
             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]))
 
-        // Hand a fresh copy to the consumer so our reusable scratch buffer can be
-        // overwritten by the next frame without racing the UI's coalescing read.
+        // Hand a fresh copy to the consumer.
         let frame = HDRFrame(width: width, height: height,
                              pixels: Array(pixelScratch),
                              rgbToXYZ: rgbToXYZ, pmin: pmin, pmax: pmax)
@@ -361,8 +329,7 @@ final class IPCServer {
     // MARK: - Low-level I/O helpers
 
     /// Read exactly `byteCount` bytes into `buffer`, looping over short reads.
-    /// Returns false on clean EOF (peer closed), recv timeout (EAGAIN/
-    /// EWOULDBLOCK), or any unrecoverable error. EINTR is retried.
+    /// Returns false on clean EOF, recv timeout, or any unrecoverable error.
     private func readExactBytes(fd: Int32, buffer: UnsafeMutableRawPointer, byteCount: Int) -> Bool {
         var remaining = byteCount
         var offset    = 0
@@ -375,16 +342,15 @@ final class IPCServer {
                 continue
             }
             if n == 0 {
-                return false  // peer closed connection (mid-frame if remaining > 0)
+                return false  // peer closed connection
             }
-            // n < 0: inspect errno.
             switch errno {
             case EINTR:
-                continue  // interrupted by signal, retry
+                continue
             case EAGAIN, EWOULDBLOCK:
-                return false  // SO_RCVTIMEO fired: client stalled mid-frame
+                return false
             default:
-                return false  // ECONNRESET, EPIPE, EBADF, etc.
+                return false
             }
         }
         return true
@@ -399,13 +365,13 @@ final class IPCServer {
     }
 }
 
-// MARK: - Helpers
+// MARK: - Helpers (file-private, not part of the public API)
 
 private func errnoString() -> String {
     String(cString: strerror(errno))
 }
 
-private func printErr(_ msg: String) {
+func printIPCErr(_ msg: String) {
     let data = ((msg + "\n").data(using: .utf8)) ?? Data()
     FileHandle.standardError.write(data)
 }

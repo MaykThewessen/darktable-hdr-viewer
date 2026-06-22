@@ -1,5 +1,6 @@
 import AppKit
 import Metal
+import HDRViewerCore
 
 /// Ties together the Metal view and the IPC server.
 /// Receives frames from darktable via Unix socket and forwards them to the Metal view.
